@@ -45,17 +45,17 @@ const SAFETY_PROMPT = fs.readFileSync(
   "utf-8"
 );
 
-export function runClaude(
+function spawnClaude(
   sessionId: string,
   message: string,
-  isFirstMessage: boolean
+  useResume: boolean
 ): Promise<ClaudeResult> {
   return new Promise((resolve) => {
     const args = [
       "-p",
-      ...(isFirstMessage
-        ? ["--session-id", sessionId]
-        : ["--resume", sessionId]),
+      ...(useResume
+        ? ["--resume", sessionId]
+        : ["--session-id", sessionId]),
       "--dangerously-skip-permissions",
       "--output-format",
       "json",
@@ -139,4 +139,26 @@ export function runClaude(
 
     console.log(`  Claude PID: ${proc.pid}`);
   });
+}
+
+export async function runClaude(
+  sessionId: string,
+  message: string,
+  isFirstMessage: boolean
+): Promise<ClaudeResult> {
+  const result = await spawnClaude(sessionId, message, !isFirstMessage);
+
+  // If --session-id failed because session exists, retry with --resume
+  if (result.isError && result.result.includes("already in use")) {
+    console.log("  Session exists — retrying with --resume");
+    return spawnClaude(sessionId, message, true);
+  }
+
+  // If --resume failed because session doesn't exist, retry with --session-id
+  if (result.isError && result.result.includes("No session found")) {
+    console.log("  Session not found — retrying with --session-id");
+    return spawnClaude(sessionId, message, false);
+  }
+
+  return result;
 }
