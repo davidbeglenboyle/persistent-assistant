@@ -116,8 +116,8 @@ export function createBot(token: string, allowedChatId: number): Bot {
 
       clearInterval(typingInterval);
 
-      // Log the exchange
-      logExchange(userMessage, result.result);
+      // Log the exchange (including tool calls for audit trail)
+      logExchange(userMessage, result.result, result.toolCalls);
 
       // Send response, splitting if needed
       const chunks = splitMessage(result.result);

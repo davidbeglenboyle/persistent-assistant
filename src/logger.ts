@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import type { ToolCall } from "./claude";
 
 const LOGS_DIR = path.join(__dirname, "..", "logs");
 
@@ -24,22 +25,30 @@ function timeStamp(): string {
 
 export function logExchange(
   userMessage: string,
-  claudeResponse: string
+  claudeResponse: string,
+  toolCalls: ToolCall[] = []
 ): void {
   ensureLogsDir();
   const file = todayFile();
   const time = timeStamp();
 
-  const entry = [
+  const parts = [
     `## ${time}`,
     "",
     `**User:** ${userMessage}`,
     "",
     `**Claude:** ${claudeResponse}`,
     "",
-    "---",
-    "",
-  ].join("\n");
+  ];
 
-  fs.appendFileSync(file, entry);
+  if (toolCalls.length > 0) {
+    const toolSummary = toolCalls
+      .map((tc) => `${tc.name} (${tc.summary})`)
+      .join(", ");
+    parts.push(`*Tools: ${toolSummary}*`, "");
+  }
+
+  parts.push("---", "");
+
+  fs.appendFileSync(file, parts.join("\n"));
 }

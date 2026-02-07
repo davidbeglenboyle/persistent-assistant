@@ -169,6 +169,24 @@ Credentials not loaded. Check:
 2. Or Keychain entries are stored correctly (macOS)
 3. Or environment variables are exported before running
 
+## Tool Call Audit Trail
+
+The bridge uses `--output-format stream-json` (with `--verbose`) to capture tool calls made by Claude during each message. The conversation log at `logs/YYYY-MM-DD.md` now includes a `*Tools:*` line after each response, showing which tools were used:
+
+```markdown
+## 04:21
+
+**User:** What files are in the project?
+
+**Claude:** I found 12 files in the src/ directory...
+
+*Tools: Glob (src/**/*), Read (src/index.ts)*
+
+---
+```
+
+The `summarizeToolInput` function in `claude.ts` produces human-readable summaries for common tools (Read, Edit, Bash, Glob, Grep, etc.). If no tools were used, the line is omitted.
+
 ## Important Notes for Agents
 
 - This project uses `--dangerously-skip-permissions` which means full tool access without confirmation prompts. The safety prompt in `src/safety-prompt.txt` provides advisory guardrails.
