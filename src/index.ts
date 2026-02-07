@@ -23,10 +23,23 @@ console.log();
 
 const bot = createBot(token, Number(chatId));
 
+// Catch middleware errors so grammy doesn't stop the bot and throw
+bot.catch((err) => {
+  console.error(`Error handling update ${err.ctx?.update?.update_id}:`, err.error);
+});
+
 bot.start({
   onStart: (botInfo) => {
     console.log(`Bot @${botInfo.username} is running. Send messages via Telegram.`);
   },
+}).catch((err) => {
+  console.error("Bot polling fatal error:", err);
+  process.exit(1);
+});
+
+// Safety net — log unhandled rejections but don't crash
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason);
 });
 
 // Graceful shutdown

@@ -34,7 +34,12 @@ export function createBot(token: string, allowedChatId: number): Bot {
   const bot = new Bot(token);
 
   // Track which sessions have had at least one message
+  // Pre-populate from session file so restarts use --resume, not --session-id
   const activeSessions = new Set<string>();
+  const currentSession = getOrCreateSession();
+  if (currentSession.messageCount > 0) {
+    activeSessions.add(currentSession.sessionId);
+  }
 
   bot.command("new", async (ctx: Context) => {
     if (ctx.chat?.id !== allowedChatId) return;
@@ -124,7 +129,11 @@ export function createBot(token: string, allowedChatId: number): Bot {
     } catch (err) {
       clearInterval(typingInterval);
       console.error("  Error:", err);
-      await ctx.reply(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      try {
+        await ctx.reply(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      } catch (replyErr) {
+        console.error("  Failed to send error reply:", replyErr);
+      }
     }
   });
 
