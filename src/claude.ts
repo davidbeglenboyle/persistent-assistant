@@ -3,11 +3,17 @@ import * as os from "os";
 import * as fs from "fs";
 import * as path from "path";
 
+export interface ToolCall {
+  name: string;
+  summary: string;
+}
+
 export interface ClaudeResult {
   result: string;
   sessionId: string;
   durationMs: number;
   isError: boolean;
+  toolCalls: ToolCall[];
 }
 
 const TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -38,6 +44,42 @@ function detectClaudePath(): string {
   process.exit(1);
 }
 
+function summarizeToolInput(toolName: string, input: Record<string, unknown>): string {
+  let summary: string;
+  switch (toolName) {
+    case "Read":
+      summary = String(input.file_path || "").split("/").slice(-2).join("/");
+      break;
+    case "Edit":
+    case "Write":
+      summary = String(input.file_path || "").split("/").slice(-2).join("/");
+      break;
+    case "Bash":
+      summary = String(input.command || "").replace(/\n[\s\S]*/g, " ...").slice(0, 80);
+      break;
+    case "Glob":
+      summary = String(input.pattern || "");
+      break;
+    case "Grep":
+      summary = String(input.pattern || "");
+      break;
+    case "Task":
+      summary = String(input.description || "").slice(0, 60);
+      break;
+    case "Skill":
+      summary = String(input.skill || "") + (input.args ? `: ${String(input.args).slice(0, 40)}` : "");
+      break;
+    case "WebFetch":
+      summary = String(input.url || "").slice(0, 60);
+      break;
+    default:
+      summary = JSON.stringify(input).slice(0, 60);
+      break;
+  }
+  // Ensure single-line — strip any surviving newlines
+  return summary.replace(/[\r\n]+/g, " ").trim();
+}
+
 const CLAUDE_PATH = detectClaudePath();
 
 const SAFETY_PROMPT = fs.readFileSync(
@@ -57,8 +99,9 @@ function spawnClaude(
         ? ["--resume", sessionId]
         : ["--session-id", sessionId]),
       "--dangerously-skip-permissions",
+      "--verbose",
       "--output-format",
-      "json",
+      "stream-json",
       "--append-system-prompt",
       SAFETY_PROMPT,
       message,
@@ -100,28 +143,60 @@ function spawnClaude(
           sessionId,
           durationMs: 0,
           isError: true,
+          toolCalls: [],
         });
         return;
       }
 
-      try {
-        const json = JSON.parse(stdout);
-        console.log(`  Success: ${json.duration_ms}ms`);
+      // Parse stream-json NDJSON output
+      const lines = stdout.trim().split("\n").filter(Boolean);
+      const toolCalls: ToolCall[] = [];
+      let finalResult = "";
+      let sessionIdFromOutput = sessionId;
+      let durationMs = 0;
+      let isError = false;
+
+      for (const line of lines) {
+        try {
+          const obj = JSON.parse(line);
+          if (obj.type === "assistant" && obj.message?.content) {
+            for (const block of obj.message.content) {
+              if (block.type === "tool_use") {
+                toolCalls.push({
+                  name: block.name,
+                  summary: summarizeToolInput(block.name, block.input || {}),
+                });
+              }
+            }
+          }
+          if (obj.type === "result") {
+            finalResult = obj.result || "(empty response)";
+            sessionIdFromOutput = obj.session_id || sessionId;
+            durationMs = obj.duration_ms || 0;
+            isError = obj.is_error || false;
+          }
+        } catch { /* skip unparseable lines */ }
+      }
+
+      if (finalResult) {
+        console.log(`  Success: ${durationMs}ms, ${toolCalls.length} tool calls`);
         resolve({
-          result: json.result || "(empty response)",
-          sessionId: json.session_id || sessionId,
-          durationMs: json.duration_ms || 0,
-          isError: json.is_error || false,
+          result: finalResult,
+          sessionId: sessionIdFromOutput,
+          durationMs,
+          isError,
+          toolCalls,
         });
-      } catch {
-        // JSON parse failed — return raw stdout
+      } else {
+        // No result line found — fall back to raw output
         const text = stdout.trim() || stderr.trim() || "(no output)";
-        console.log(`  Parse error. Raw: ${text.slice(0, 200)}`);
+        console.log(`  No result line found. Raw: ${text.slice(0, 200)}`);
         resolve({
           result: text.slice(0, 4000),
           sessionId,
           durationMs: 0,
           isError: true,
+          toolCalls: [],
         });
       }
     });
@@ -134,6 +209,7 @@ function spawnClaude(
         sessionId,
         durationMs: 0,
         isError: true,
+        toolCalls: [],
       });
     });
 
