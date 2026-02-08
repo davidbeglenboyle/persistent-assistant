@@ -25,12 +25,13 @@ Node.js process (grammy)
        ↓ FIFO queue (one message at a time)
        ↓ spawns:
 claude -p --resume $SESSION_ID \
-  --dangerously-skip-permissions \
-  --output-format json \
+  --allowed-tools "Read,Edit,Write,..." \
+  --permission-mode default \
+  --output-format stream-json \
   --append-system-prompt "safety rules..." \
   "your message"
        ↓ waits for completion
-       ↓ parses JSON response
+       ↓ parses NDJSON response
 Node.js process
        ↓ extracts response text
        ↓ splits if >4096 chars
@@ -45,6 +46,7 @@ Long-polling means the bot works behind NAT, firewalls, and home routers without
 
 * **Full Claude Code capabilities** — File editing, bash commands, git operations, MCP servers, web search, everything Claude Code can do
 * **Session persistence** — Conversation context preserved across messages via `--resume`
+* **Enforced tool permissions** — `--allowed-tools` whitelist pre-approves safe tools; denied tools are surfaced via Telegram for approval
 * **Safety prompt** — An advisory system prompt that requires Claude to ask for confirmation before destructive actions (file deletion, force push, sending emails, etc.)
 * **Chat ID whitelist** — Only your Telegram account can talk to the bot
 * **Auto-split long responses** — Messages longer than Telegram's 4,096-character limit are split automatically
@@ -73,7 +75,7 @@ For manual setup, read [CLAUDE.md](CLAUDE.md) directly.
 
 * **Node.js 18+** — `node --version` to check
 * **Claude Code CLI** — installed and authenticated (`claude --version` to check)
-* **Claude Max or API access** — Claude Code must be able to run with `--dangerously-skip-permissions`
+* **Claude Max or API access** — Claude Code must be able to make API calls
 * **Telegram account** — for the bot and your chat
 * **macOS or Linux** — Windows should work via WSL but is untested
 
@@ -81,11 +83,11 @@ For manual setup, read [CLAUDE.md](CLAUDE.md) directly.
 
 Read this section carefully before using.
 
-1. **`--dangerously-skip-permissions` is required.** Claude has full autonomy over your filesystem, terminal, and any connected services. There is no way around this — without it, Claude Code prompts for confirmation on every tool use, which is impossible through Telegram.
+1. **Tool permissions are enforced, not advisory.** The bridge uses `--allowed-tools` to whitelist safe tools (file reading, editing, search, web access). When Claude tries to use a tool that is not whitelisted — typically Bash — the bridge surfaces the exact command on Telegram and waits for your approval. This is a hard boundary enforced by Claude Code, not a prompt-level suggestion. However, pre-approved tools (Read, Write, Edit, Glob, Grep, etc.) execute without asking.
 
-2. **The safety prompt is advisory, not enforced.** An appended system prompt instructs Claude to ask for confirmation before destructive actions. Claude treats this with high priority in practice, but it is not a hard boundary. Claude could theoretically ignore it.
+2. **The safety prompt is advisory.** On top of the enforced tool whitelist, an appended system prompt instructs Claude to ask for confirmation before destructive actions. Claude treats this with high priority in practice, but it is not a hard technical boundary.
 
-3. **You cannot see intermediate actions.** You only see Claude's final text response. Between your message and that response, Claude may have edited files, run bash commands, made API calls, or taken other actions you did not expect.
+3. **You cannot see intermediate actions.** You only see Claude's final text response. Between your message and that response, Claude may have edited files, searched your codebase, or taken other pre-approved actions you did not expect. The conversation log captures tool calls for post-hoc review.
 
 4. **Single-user only.** One bot token supports one active connection. Running the bot on two machines simultaneously causes polling conflicts.
 
@@ -112,9 +114,17 @@ persistent-assistant/
 └── package.json
 ```
 
-### How the safety prompt works
+### Two-layer safety model
 
-The file `src/safety-prompt.txt` is injected into every Claude invocation via `--append-system-prompt`. It adds five mandatory confirmation rules on top of Claude's default system prompt:
+Safety is enforced at two levels:
+
+**Layer 1: Tool whitelist (enforced by Claude Code)**
+
+The bridge passes `--allowed-tools` with a whitelist of safe tools: Read, Edit, Write, Glob, Grep, Task, WebFetch, WebSearch, and others. Tools not on the list — primarily Bash — are denied by Claude Code at the engine level. When a denial occurs, the bridge shows the exact tool and input on Telegram and waits for approval. If you reply "yes", the bridge retries with that tool temporarily allowed.
+
+**Layer 2: Safety prompt (advisory)**
+
+The file `src/safety-prompt.txt` is injected into every invocation via `--append-system-prompt`. It adds five confirmation rules:
 
 1. **Destructive operations** — describe and wait for "yes" before deleting, force-pushing, etc.
 2. **Externally visible actions** — show exact content before pushing code, sending emails, etc.
@@ -122,7 +132,7 @@ The file `src/safety-prompt.txt` is injected into every Claude invocation via `-
 4. **Ambiguous requests** — ask for clarification when messages are vague
 5. **Multi-step tasks** — outline the plan before executing 5+ tool calls
 
-The confirmation flow works naturally: Claude asks "should I proceed?", you reply "yes" on Telegram, and the next `--resume` invocation picks up the context and executes.
+Both layers use the same confirmation flow: Claude asks "should I proceed?", you reply "yes" on Telegram, and the next `--resume` invocation picks up the context and executes.
 
 You can edit `src/safety-prompt.txt` to add your own rules without touching any TypeScript.
 
@@ -131,6 +141,7 @@ You can edit `src/safety-prompt.txt` to add your own rules without touching any 
 | Setting | Location | Default |
 |---------|----------|---------|
 | Claude binary path | `CLAUDE_PATH` env var | Auto-detected |
+| Tool whitelist | `ALLOWED_TOOLS` in `src/claude.ts` | All built-in tools except Bash |
 | Timeout per message | `src/claude.ts` | 10 minutes |
 | Telegram message limit | `src/bot.ts` | 4,096 characters |
 | Safety prompt | `src/safety-prompt.txt` | Editable text file |
