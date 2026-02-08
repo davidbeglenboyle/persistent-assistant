@@ -150,11 +150,189 @@ You can edit `src/safety-prompt.txt` to add your own rules without touching any 
 
 ## Running in the Background
 
+### Quick: nohup
+
 ```bash
 nohup bash scripts/start.sh > /tmp/persistent-assistant.log 2>&1 &
 ```
 
 To stop: `pkill -f "tsx src/index.ts"`
+
+### Robust: launchd (macOS)
+
+For auto-start on login and auto-restart on crash, use a LaunchAgent. First, create a runtime copy outside any cloud-synced folder (launchd processes cannot access iCloud Drive or Dropbox paths due to macOS TCC restrictions):
+
+```bash
+mkdir -p ~/.persistent-assistant
+rsync -av --exclude='node_modules' --exclude='logs' --exclude='.git' \
+  ~/persistent-assistant/ ~/.persistent-assistant/
+cd ~/.persistent-assistant && npm install
+```
+
+Create `~/Library/LaunchAgents/com.persistent-assistant.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.persistent-assistant</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/YOU/.persistent-assistant/scripts/start.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/YOU/.persistent-assistant</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/persistent-assistant.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/persistent-assistant.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/YOU</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+```
+
+Replace `/Users/YOU` with your actual home directory path (`echo $HOME`).
+
+```bash
+# Start
+launchctl load ~/Library/LaunchAgents/com.persistent-assistant.plist
+
+# Stop
+launchctl unload ~/Library/LaunchAgents/com.persistent-assistant.plist
+
+# Check status (PID in first column = running)
+launchctl list | grep persistent-assistant
+
+# View logs
+tail -f ~/Library/Logs/persistent-assistant.log
+```
+
+Key details:
+* `KeepAlive: true` — launchd restarts the process if it crashes
+* `ThrottleInterval: 10` — minimum 10 seconds between restarts (prevents crash loops)
+* `EnvironmentVariables` — launchd provides an extremely minimal environment; without explicit PATH, Node.js and the Claude CLI will not be found
+* `RunAtLoad: true` — starts automatically when you log in
+
+### Linux: systemd
+
+The equivalent for Linux. Create `~/.config/systemd/user/persistent-assistant.service`:
+
+```ini
+[Unit]
+Description=Telegram-Claude Bridge
+
+[Service]
+ExecStart=/usr/bin/bash /home/YOU/.persistent-assistant/scripts/start.sh
+WorkingDirectory=/home/YOU/.persistent-assistant
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user enable persistent-assistant
+systemctl --user start persistent-assistant
+journalctl --user -u persistent-assistant -f
+```
+
+## Setting Up on a Second Machine
+
+If you want to run the bot from a different computer, the code is portable but several things are machine-specific.
+
+### Prerequisites
+
+* Node.js 18+ installed
+* Claude Code CLI installed and authenticated
+* Credentials from the original machine (bot token and chat ID)
+
+### 1. Clone or copy the project
+
+```bash
+git clone https://github.com/YOUR_USER/persistent-assistant.git
+cd persistent-assistant
+npm install
+```
+
+If the project is in a cloud-synced folder (Dropbox, iCloud), apply the `.nosync` pattern to prevent sync storms from `node_modules`:
+```bash
+mv node_modules node_modules.nosync && ln -s node_modules.nosync node_modules
+```
+
+### 2. Transfer credentials
+
+Credentials are per-machine and do not sync automatically.
+
+**If using `.env`:** Copy `.env` from the original machine, or create a new one from `.env.example` with the same token and chat ID.
+
+**If using macOS Keychain:** Re-store the secrets on the new machine:
+```bash
+security add-generic-password -s "TELEGRAM_BOT_TOKEN" -a "persistent-assistant" -w "YOUR_TOKEN"
+security add-generic-password -s "TELEGRAM_CHAT_ID" -a "persistent-assistant" -w "YOUR_CHAT_ID"
+```
+
+### 3. Check the Claude CLI path
+
+The bridge auto-detects the Claude binary in common locations. Verify it is found:
+```bash
+which claude
+```
+
+If the path is non-standard, set `CLAUDE_PATH` in your `.env` file.
+
+### 4. Create a runtime copy (if using launchd)
+
+If running via launchd, create a local runtime copy outside cloud-synced folders:
+```bash
+mkdir -p ~/.persistent-assistant
+rsync -av --exclude='node_modules' --exclude='logs' --exclude='.git' \
+  ~/persistent-assistant/ ~/.persistent-assistant/
+cd ~/.persistent-assistant && npm install
+```
+
+Always run `npm install` fresh in the runtime copy — `node_modules` contains platform-specific binaries (esbuild) that may differ between machines.
+
+### 5. Stop on the old machine, start on the new one
+
+Telegram long-polling allows only one active connection per bot token. Running the bot on two machines causes polling conflicts — messages may be received by only one instance unpredictably.
+
+```bash
+# On the OLD machine:
+launchctl unload ~/Library/LaunchAgents/com.persistent-assistant.plist
+# Or: pkill -f "tsx src/index.ts"
+
+# On the NEW machine:
+launchctl load ~/Library/LaunchAgents/com.persistent-assistant.plist
+# Or: bash scripts/start.sh
+```
+
+### 6. Session state
+
+The session file (`~/.claude-bridge-session`) and Claude Code's conversation history (`~/.claude/projects/`) are both per-machine and do not sync. The new machine starts a fresh session. This is intentional — resuming a session created on a different machine would reference file paths and tool outputs that may not exist locally.
+
+### Known quirks
+
+* **macOS TCC warning on startup:** If the startup script includes an rsync to a cloud-synced folder, launchd processes will emit "Operation not permitted". This is cosmetic — launchd agents cannot access `~/Library/CloudStorage/` by design.
+* **Node.js v25 punycode deprecation:** A warning about the `punycode` module appears on startup. Harmless, no impact on functionality.
 
 ## License
 
