@@ -116,6 +116,7 @@ function spawnClaude(
         ? ["--resume", sessionId]
         : ["--session-id", sessionId]),
       "--allowed-tools", tools.join(","),
+      "--permission-mode", "default",
       "--verbose",
       "--output-format",
       "stream-json",
