@@ -8,15 +8,30 @@ export interface ToolCall {
   summary: string;
 }
 
+export interface PermissionDenial {
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+}
+
 export interface ClaudeResult {
   result: string;
   sessionId: string;
   durationMs: number;
   isError: boolean;
   toolCalls: ToolCall[];
+  permissionDenials: PermissionDenial[];
 }
 
 const TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+// Tools pre-approved without Telegram confirmation. Bash requires explicit approval.
+const ALLOWED_TOOLS = [
+  "Read", "Edit", "Write", "Glob", "Grep",
+  "Task", "TaskOutput", "WebFetch", "WebSearch",
+  "NotebookEdit", "Skill", "EnterPlanMode", "ExitPlanMode",
+  "AskUserQuestion", "TaskCreate", "TaskGet", "TaskUpdate",
+  "TaskList", "TaskStop",
+];
 
 function detectClaudePath(): string {
   // Explicit env var takes priority
@@ -44,7 +59,7 @@ function detectClaudePath(): string {
   process.exit(1);
 }
 
-function summarizeToolInput(toolName: string, input: Record<string, unknown>): string {
+export function summarizeToolInput(toolName: string, input: Record<string, unknown>): string {
   let summary: string;
   switch (toolName) {
     case "Read":
@@ -90,15 +105,17 @@ const SAFETY_PROMPT = fs.readFileSync(
 function spawnClaude(
   sessionId: string,
   message: string,
-  useResume: boolean
+  useResume: boolean,
+  extraAllowedTools: string[] = []
 ): Promise<ClaudeResult> {
   return new Promise((resolve) => {
+    const tools = [...ALLOWED_TOOLS, ...extraAllowedTools];
     const args = [
       "-p",
       ...(useResume
         ? ["--resume", sessionId]
         : ["--session-id", sessionId]),
-      "--dangerously-skip-permissions",
+      "--allowed-tools", tools.join(","),
       "--verbose",
       "--output-format",
       "stream-json",
@@ -117,6 +134,7 @@ function spawnClaude(
 
     let stdout = "";
     let stderr = "";
+    let wasTimedOut = false;
 
     proc.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
@@ -127,6 +145,7 @@ function spawnClaude(
     });
 
     const timer = setTimeout(() => {
+      wasTimedOut = true;
       console.log("  Timeout reached — killing Claude process");
       proc.kill("SIGTERM");
       setTimeout(() => proc.kill("SIGKILL"), 5000);
@@ -144,6 +163,7 @@ function spawnClaude(
           durationMs: 0,
           isError: true,
           toolCalls: [],
+          permissionDenials: [],
         });
         return;
       }
@@ -151,14 +171,20 @@ function spawnClaude(
       // Parse stream-json NDJSON output
       const lines = stdout.trim().split("\n").filter(Boolean);
       const toolCalls: ToolCall[] = [];
+      let assistantText = "";
+      const lineTypeCounts: Record<string, number> = {};
       let finalResult = "";
       let sessionIdFromOutput = sessionId;
       let durationMs = 0;
       let isError = false;
+      let permissionDenials: PermissionDenial[] = [];
 
       for (const line of lines) {
         try {
           const obj = JSON.parse(line);
+          if (obj.type) {
+            lineTypeCounts[obj.type] = (lineTypeCounts[obj.type] || 0) + 1;
+          }
           if (obj.type === "assistant" && obj.message?.content) {
             for (const block of obj.message.content) {
               if (block.type === "tool_use") {
@@ -167,36 +193,58 @@ function spawnClaude(
                   summary: summarizeToolInput(block.name, block.input || {}),
                 });
               }
+              if (block.type === "text" && block.text) {
+                assistantText += block.text;
+              }
             }
           }
           if (obj.type === "result") {
-            finalResult = obj.result || "(empty response)";
+            finalResult = obj.result || assistantText || "(empty response)";
             sessionIdFromOutput = obj.session_id || sessionId;
             durationMs = obj.duration_ms || 0;
             isError = obj.is_error || false;
+            permissionDenials = obj.permission_denials || [];
           }
         } catch { /* skip unparseable lines */ }
       }
 
       if (finalResult) {
-        console.log(`  Success: ${durationMs}ms, ${toolCalls.length} tool calls`);
+        if (permissionDenials.length > 0) {
+          console.log(`  Success: ${durationMs}ms, ${toolCalls.length} tool calls, ${permissionDenials.length} permission denials`);
+        } else {
+          console.log(`  Success: ${durationMs}ms, ${toolCalls.length} tool calls`);
+        }
         resolve({
           result: finalResult,
           sessionId: sessionIdFromOutput,
           durationMs,
           isError,
           toolCalls,
+          permissionDenials,
         });
       } else {
-        // No result line found — fall back to raw output
-        const text = stdout.trim() || stderr.trim() || "(no output)";
-        console.log(`  No result line found. Raw: ${text.slice(0, 200)}`);
+        // No result line found — never send raw JSON
+        console.log(`  No result line found. Line types: ${JSON.stringify(lineTypeCounts)}, assistant text length: ${assistantText.length}`);
+
+        let fallbackResult: string;
+
+        if (wasTimedOut && assistantText) {
+          fallbackResult = `(Timed out after ${TIMEOUT_MS / 60000} minutes — partial response below)\n\n${assistantText.slice(0, 3800)}`;
+        } else if (wasTimedOut) {
+          fallbackResult = `(Timed out after ${TIMEOUT_MS / 60000} minutes with no response text. Claude was likely busy with tool calls. You can ask "what did you do?" to get a summary.)`;
+        } else if (assistantText) {
+          fallbackResult = assistantText.slice(0, 4000);
+        } else {
+          fallbackResult = "(No response received from Claude. Check logs for details.)";
+        }
+
         resolve({
-          result: text.slice(0, 4000),
+          result: fallbackResult,
           sessionId,
           durationMs: 0,
-          isError: true,
-          toolCalls: [],
+          isError: wasTimedOut || !assistantText,
+          toolCalls,
+          permissionDenials,
         });
       }
     });
@@ -210,6 +258,7 @@ function spawnClaude(
         durationMs: 0,
         isError: true,
         toolCalls: [],
+        permissionDenials: [],
       });
     });
 
@@ -220,20 +269,21 @@ function spawnClaude(
 export async function runClaude(
   sessionId: string,
   message: string,
-  isFirstMessage: boolean
+  isFirstMessage: boolean,
+  extraAllowedTools: string[] = []
 ): Promise<ClaudeResult> {
-  const result = await spawnClaude(sessionId, message, !isFirstMessage);
+  const result = await spawnClaude(sessionId, message, !isFirstMessage, extraAllowedTools);
 
   // If --session-id failed because session exists, retry with --resume
   if (result.isError && result.result.includes("already in use")) {
     console.log("  Session exists — retrying with --resume");
-    return spawnClaude(sessionId, message, true);
+    return spawnClaude(sessionId, message, true, extraAllowedTools);
   }
 
   // If --resume failed because session doesn't exist, retry with --session-id
   if (result.isError && result.result.includes("No session found")) {
     console.log("  Session not found — retrying with --session-id");
-    return spawnClaude(sessionId, message, false);
+    return spawnClaude(sessionId, message, false, extraAllowedTools);
   }
 
   return result;

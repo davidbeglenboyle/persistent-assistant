@@ -1,5 +1,5 @@
 import { Bot, Context } from "grammy";
-import { runClaude } from "./claude";
+import { runClaude, PermissionDenial, summarizeToolInput } from "./claude";
 import { enqueue, queueLength } from "./queue";
 import {
   getOrCreateSession,
@@ -9,6 +9,8 @@ import {
 } from "./session";
 
 import { logExchange } from "./logger";
+
+const APPROVAL_PATTERN = /^(yes|yeah|y|allow|go ahead|approved|do it|ok)$/i;
 
 const TELEGRAM_MAX_LENGTH = 4096;
 
@@ -41,8 +43,15 @@ export function createBot(token: string, allowedChatId: number): Bot {
     activeSessions.add(currentSession.sessionId);
   }
 
+  // Track pending permission approval state
+  let pendingPermission: {
+    denials: PermissionDenial[];
+    deniedToolNames: string[];
+  } | null = null;
+
   bot.command("new", async (ctx: Context) => {
     if (ctx.chat?.id !== allowedChatId) return;
+    pendingPermission = null;
     const session = newSession();
     activeSessions.delete(session.sessionId);
     await ctx.reply(
@@ -79,6 +88,20 @@ export function createBot(token: string, allowedChatId: number): Bot {
 
     console.log(`\nMessage received: ${userMessage.slice(0, 100)}...`);
 
+    // Check if this is a permission approval for a pending denial
+    const isApproval = pendingPermission && APPROVAL_PATTERN.test(userMessage.trim());
+    const extraTools = isApproval ? pendingPermission!.deniedToolNames : [];
+    const claudeMessage = isApproval
+      ? "Permission granted for the previously denied tool(s). Please proceed with the previous request."
+      : userMessage;
+
+    if (isApproval) {
+      console.log(`  Permission approved for: ${extraTools.join(", ")}`);
+    }
+
+    // Clear pending permission (consumed or superseded by new message)
+    pendingPermission = null;
+
     // Send typing indicator
     await ctx.replyWithChatAction("typing");
 
@@ -102,8 +125,9 @@ export function createBot(token: string, allowedChatId: number): Bot {
 
         const claudeResult = await runClaude(
           session.sessionId,
-          userMessage,
-          isFirst
+          claudeMessage,
+          isFirst,
+          extraTools
         );
 
         if (!claudeResult.isError) {
@@ -119,8 +143,28 @@ export function createBot(token: string, allowedChatId: number): Bot {
       // Log the exchange (including tool calls for audit trail)
       logExchange(userMessage, result.result, result.toolCalls);
 
+      // Build response text
+      let responseText = result.result;
+
+      // If tools were denied, append a permission prompt
+      if (result.permissionDenials.length > 0) {
+        const denialSummaries = result.permissionDenials.map((d) => {
+          const summary = summarizeToolInput(d.tool_name, d.tool_input || {});
+          return `• ${d.tool_name}: \`${summary}\``;
+        });
+        responseText += `\n\n🔐 Permission needed:\n${denialSummaries.join("\n")}\nReply 'yes' to allow.`;
+
+        // Track for next message
+        const deniedToolNames = [...new Set(result.permissionDenials.map((d) => d.tool_name))];
+        pendingPermission = {
+          denials: result.permissionDenials,
+          deniedToolNames,
+        };
+        console.log(`  Permission denials: ${deniedToolNames.join(", ")}`);
+      }
+
       // Send response, splitting if needed
-      const chunks = splitMessage(result.result);
+      const chunks = splitMessage(responseText);
       for (const chunk of chunks) {
         await ctx.reply(chunk);
       }

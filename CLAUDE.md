@@ -189,7 +189,7 @@ The `summarizeToolInput` function in `claude.ts` produces human-readable summari
 
 ## Important Notes for Agents
 
-- This project uses `--dangerously-skip-permissions` which means full tool access without confirmation prompts. The safety prompt in `src/safety-prompt.txt` provides advisory guardrails.
+- This project uses `--allowed-tools` to whitelist all built-in tools except Bash. When Claude needs Bash, the bridge asks the user via Telegram and retries with temporary permission if approved. The safety prompt in `src/safety-prompt.txt` provides an additional advisory layer.
 - The `uuid` package is not used — session IDs use native `crypto.randomUUID()` (Node.js 18+).
 - The `__dirname` reference in `claude.ts` resolves to `src/` at runtime via `tsx`. This works because `tsx` runs TypeScript directly without compiling to a separate `dist/` directory.
 - Conversation logs go to `logs/` which is gitignored. These may contain sensitive information from the user's Claude sessions.
