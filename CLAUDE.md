@@ -2,6 +2,10 @@
 
 This file is read automatically by Claude Code. It contains interactive setup instructions and operational context for running the Telegram-to-Claude-Code bridge.
 
+## Git Workflow
+
+Always use pull requests for changes to this repo — never push directly to `main`. This is a public repo and people follow the commit history. Create a feature branch, push it, and open a PR with `gh pr create`.
+
 ## First-Time Setup
 
 When the user asks for help setting up, walk them through each step interactively. Ask for their input at each step — do not skip ahead or assume values.
