@@ -191,9 +191,22 @@ The bridge uses `--output-format stream-json` (with `--verbose`) to capture tool
 
 The `summarizeToolInput` function in `claude.ts` produces human-readable summaries for common tools (Read, Edit, Bash, Glob, Grep, etc.). If no tools were used, the line is omitted.
 
+## Email Bridge
+
+The project also includes an email bridge (`src/email-bridge.ts`) that polls Gmail for keyword-prefixed emails. Setup requires:
+
+1. Google Cloud OAuth credentials saved to `~/.config/gmail-bridge/credentials.json`
+2. Gmail API enabled on the project
+3. Running `npm run setup-gmail` for one-time consent
+4. Setting `GMAIL_ALLOWED_SENDER` to the user's email address
+5. Starting with `npm run email`
+
+The email bridge reuses `claude.ts`, `queue.ts`, and `logger.ts` from the Telegram bridge. It has its own safety prompt at `src/email-safety-prompt.txt` and its own session file (default: `~/.claude-email-session`).
+
 ## Important Notes for Agents
 
-- This project uses `--allowed-tools` to whitelist all built-in tools except Bash. When Claude needs Bash, the bridge asks the user via Telegram and retries with temporary permission if approved. The safety prompt in `src/safety-prompt.txt` provides an additional advisory layer.
+- This project uses `--allowed-tools` to whitelist all built-in tools except Bash. When Claude needs Bash, the bridge asks the user via Telegram/email and retries with temporary permission if approved. The safety prompts in `src/safety-prompt.txt` and `src/email-safety-prompt.txt` provide an additional advisory layer.
 - The `uuid` package is not used — session IDs use native `crypto.randomUUID()` (Node.js 18+).
 - The `__dirname` reference in `claude.ts` resolves to `src/` at runtime via `tsx`. This works because `tsx` runs TypeScript directly without compiling to a separate `dist/` directory.
 - Conversation logs go to `logs/` which is gitignored. These may contain sensitive information from the user's Claude sessions.
+- The `googleapis` dependency is only used by the email bridge. The Telegram bridge does not require it.

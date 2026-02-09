@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-02-09
+
+### Email bridge — control Claude Code via email
+- New `src/email-bridge.ts` entrypoint: polls Gmail for emails with a configurable keyword in the subject
+- New `src/gmail.ts`: Gmail API client with OAuth token refresh, email parsing, and in-thread replies
+- New `src/email-safety-prompt.txt`: advisory safety rules adapted for email context
+- New `scripts/setup-gmail-oauth.ts`: one-time OAuth consent flow for Gmail API access
+- Privacy-first design: only processes emails from a configured sender, only replies to that sender, never adds CC/BCC
+- Configurable via environment variables: `GMAIL_ALLOWED_SENDER`, `GMAIL_KEYWORD`, `GMAIL_POLL_INTERVAL`
+- Separate session from Telegram (stored at `~/.claude-email-session`)
+- Subject prefix filter: Gmail search is loose, so code-level regex ensures only exact matches are processed
+- `KEYWORD NEW:` subject prefix starts a fresh Claude session
+- Reuses existing `claude.ts`, `queue.ts`, and `logger.ts` — no duplication
+- Added `googleapis` dependency for Gmail API
+- Updated `.env.example` with email bridge configuration
+- Updated `.gitignore` to exclude OAuth credential files
+
 ## 2026-02-08
 
 ### Transfer documentation and background running guide

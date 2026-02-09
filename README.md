@@ -1,10 +1,14 @@
 # persistent-assistant
 
-Control Claude Code from your phone via Telegram.
+Control Claude Code from your phone via Telegram or Email.
 
 Claude Code is the most capable way to use Claude — it can edit files, run terminal commands, manage git repos, search your codebase, and use MCP servers. But it requires you to be sitting at your laptop. Step away for a meeting, a commute, or a coffee and you lose access to all of that.
 
-This project bridges that gap. It connects a Telegram chat to a Claude Code session running on your machine, giving you full Claude Code capabilities from your phone. Ask it to check a file, run a script, push to GitHub, search your codebase — anything Claude Code can do, you can now do from Telegram.
+This project bridges that gap. It connects Telegram or Email to a Claude Code session running on your machine, giving you full Claude Code capabilities from anywhere. Ask it to check a file, run a script, push to GitHub, search your codebase — anything Claude Code can do, you can now do from your phone.
+
+**Two channels, one architecture:**
+* **Telegram** — instant, conversational, best for quick tasks and back-and-forth
+* **Email** — asynchronous, works from any device with an email client, good for longer requests
 
 ## The Problem
 
@@ -100,19 +104,25 @@ Read this section carefully before using.
 ```
 persistent-assistant/
 ├── src/
-│   ├── index.ts              # Entry point — loads env vars, starts bot
+│   ├── index.ts              # Telegram bridge entry point
+│   ├── email-bridge.ts       # Email bridge entry point
 │   ├── bot.ts                # Telegram bot (grammy, long-polling)
-│   ├── claude.ts             # Spawns Claude Code CLI, parses JSON response
-│   ├── queue.ts              # Promise-based FIFO queue
-│   ├── session.ts            # Session UUID persistence (~/.claude-bridge-session)
-│   ├── logger.ts             # Daily conversation logs (logs/YYYY-MM-DD.md)
-│   └── safety-prompt.txt     # Advisory safety rules (editable)
+│   ├── gmail.ts              # Gmail API client (poll, read, reply)
+│   ├── claude.ts             # Spawns Claude Code CLI, parses JSON response (shared)
+│   ├── queue.ts              # Promise-based FIFO queue (shared)
+│   ├── session.ts            # Session UUID persistence (shared)
+│   ├── logger.ts             # Daily conversation logs (shared)
+│   ├── safety-prompt.txt     # Telegram safety rules (editable)
+│   └── email-safety-prompt.txt  # Email safety rules (editable)
 ├── scripts/
-│   └── start.sh              # Startup wrapper (loads credentials)
+│   ├── start.sh              # Telegram startup wrapper
+│   └── setup-gmail-oauth.ts  # One-time Gmail OAuth setup
 ├── CLAUDE.md                 # Agent-facing setup guide
-├── .env.example              # Credential template
+├── .env.example              # Credential template (both bridges)
 └── package.json
 ```
+
+The Telegram and Email bridges share `claude.ts` (CLI spawner), `queue.ts` (FIFO), and `logger.ts` (daily logs). Each has its own entry point and safety prompt.
 
 ### Two-layer safety model
 
@@ -136,7 +146,89 @@ Both layers use the same confirmation flow: Claude asks "should I proceed?", you
 
 You can edit `src/safety-prompt.txt` to add your own rules without touching any TypeScript.
 
+## Email Bridge
+
+The email bridge polls Gmail for unread emails with a configurable keyword in the subject line, spawns Claude Code, and replies in the same email thread.
+
+### How it works
+
+```
+You (any email client)
+       ↓ send email to yourself with "CLAUDE: your question" as subject
+Gmail inbox
+       ↓ polled every 60 seconds
+Node.js process
+       ↓ verifies sender matches GMAIL_ALLOWED_SENDER
+       ↓ extracts prompt from subject + body
+       ↓ FIFO queue → spawns claude -p --resume
+       ↓ parses response
+Gmail API
+       ↓ sends reply in same thread
+You receive the reply
+```
+
+### Privacy safeguards
+
+* **Sender whitelist** — only processes emails from `GMAIL_ALLOWED_SENDER`
+* **Reply-to-sender only** — always replies to the allowed sender address, never adds CC/BCC
+* **No recipient inference** — even if you mention someone in the body, Claude never adds people to the thread
+* **Subject keyword gate** — must match `KEYWORD:` prefix exactly (after stripping `Re:`)
+
+### Email bridge setup
+
+1. **Create Google OAuth credentials:**
+   * Go to https://console.cloud.google.com/apis/credentials
+   * Create an OAuth 2.0 Client ID (Desktop app type)
+   * Download JSON, save as `~/.config/gmail-bridge/credentials.json`
+   * Enable Gmail API at https://console.cloud.google.com/apis/library/gmail.googleapis.com
+
+2. **Run the OAuth consent flow:**
+   ```bash
+   npm run setup-gmail
+   ```
+   This opens your browser. Click "Allow", and the token is saved automatically.
+
+3. **Configure and start:**
+   ```bash
+   export GMAIL_ALLOWED_SENDER=you@example.com
+   npm run email
+   ```
+
+4. **Test it:** Send yourself an email with subject `CLAUDE: what time is it?` — you should receive a reply within about 90 seconds.
+
+### Email commands
+
+* `CLAUDE: your question` — sends the question to Claude
+* `CLAUDE NEW: your question` — starts a fresh session, then sends the question
+* Reply to a Claude response — continues the conversation in the same session
+
+### Email configuration
+
+| Setting | Env var | Default |
+|---------|---------|---------|
+| Allowed sender | `GMAIL_ALLOWED_SENDER` | *(required)* |
+| Subject keyword | `GMAIL_KEYWORD` | `CLAUDE` |
+| Poll interval | `GMAIL_POLL_INTERVAL` | `60` seconds |
+| OAuth config dir | `GMAIL_CONFIG_DIR` | `~/.config/gmail-bridge` |
+| Session file | `GMAIL_SESSION_FILE` | `~/.claude-email-session` |
+
+### Running both bridges
+
+The Telegram and Email bridges run as separate processes with separate sessions. You can run both simultaneously:
+
+```bash
+# Terminal 1 (or launchd service 1)
+npm start          # Telegram bridge
+
+# Terminal 2 (or launchd service 2)
+npm run email      # Email bridge
+```
+
+Each bridge maintains its own session UUID, so conversations are independent. Use Telegram for quick back-and-forth; use email for longer, asynchronous requests.
+
 ## Configuration
+
+### Telegram settings
 
 | Setting | Location | Default |
 |---------|----------|---------|
