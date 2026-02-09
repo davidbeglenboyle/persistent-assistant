@@ -107,7 +107,7 @@ persistent-assistant/
 │   ├── index.ts              # Telegram bridge entry point
 │   ├── email-bridge.ts       # Email bridge entry point
 │   ├── bot.ts                # Telegram bot (grammy, long-polling)
-│   ├── gmail.ts              # Gmail API client (poll, read, reply)
+│   ├── gmail.ts              # Gmail API client (poll, read, download attachments, reply)
 │   ├── claude.ts             # Spawns Claude Code CLI, parses JSON response (shared)
 │   ├── queue.ts              # Promise-based FIFO queue (shared)
 │   ├── session.ts            # Session UUID persistence (shared)
@@ -148,18 +148,25 @@ You can edit `src/safety-prompt.txt` to add your own rules without touching any 
 
 ## Email Bridge
 
-The email bridge polls Gmail for unread emails with a configurable keyword in the subject line, spawns Claude Code, and replies in the same email thread.
+The email bridge polls Gmail for matching emails, spawns Claude Code, and replies in the same email thread. It supports two trigger modes:
+
+1. **Plus-address mode** (recommended): forward any email to a plus-addressed email (e.g. `you+claude@gmail.com`). The email subject and body become the prompt. No special formatting required.
+2. **Keyword mode**: email yourself with a keyword prefix in the subject (e.g. `CLAUDE: your question`). This was the original approach but is less convenient on mobile.
+
+Both modes download email attachments to disk and include their file paths in the prompt, so Claude can read and process them using its tools.
 
 ### How it works
 
 ```
 You (any email client)
-       ↓ send email to yourself with "CLAUDE: your question" as subject
+       ↓ forward email to you+claude@gmail.com (plus-address mode)
+       ↓  — or email yourself with "CLAUDE: question" subject (keyword mode)
 Gmail inbox
        ↓ polled every 60 seconds
 Node.js process
        ↓ verifies sender matches GMAIL_ALLOWED_SENDER
-       ↓ extracts prompt from subject + body
+       ↓ downloads attachments to /tmp/email-bridge-attachments/
+       ↓ extracts prompt from subject + body + attachment paths
        ↓ FIFO queue → spawns claude -p --resume
        ↓ parses response
 Gmail API
@@ -170,9 +177,25 @@ You receive the reply
 ### Privacy safeguards
 
 * **Sender whitelist** — only processes emails from `GMAIL_ALLOWED_SENDER`
-* **Reply-to-sender only** — always replies to the allowed sender address, never adds CC/BCC
+* **Reply-to-sender only** — always replies to the allowed sender address (not the plus-address), never adds CC/BCC
 * **No recipient inference** — even if you mention someone in the body, Claude never adds people to the thread
-* **Subject keyword gate** — must match `KEYWORD:` prefix exactly (after stripping `Re:`)
+* **Loop prevention** — Claude's own replies are skipped (SENT label without INBOX). The reply also goes to the base address (no plus-suffix), so it doesn't match the trigger search
+* **Body cap** — email body truncated at 30KB to prevent oversized forwarded threads from overwhelming context
+* **Processed-ID tracking** — local file (`~/.email-bridge-processed.json`) prevents re-processing after restarts
+
+### Attachment handling
+
+When an email contains attachments, the bridge:
+
+1. Downloads each attachment to `/tmp/email-bridge-attachments/{messageId}/`
+2. Appends a list of file paths, sizes, and MIME types to the prompt
+3. Claude decides how to handle each attachment based on size and relevance:
+   * **Small files (<50KB)**: read directly into context
+   * **Medium files (50–200KB)**: read directly or delegate to a sub-agent
+   * **Large files (>200KB)**: use a sub-agent to summarise
+   * **Images and PDFs**: Claude reads these natively (multimodal)
+
+Attachments are stored in `/tmp`, so they are automatically cleaned on reboot.
 
 ### Email bridge setup
 
@@ -189,28 +212,48 @@ You receive the reply
    This opens your browser. Click "Allow", and the token is saved automatically.
 
 3. **Configure and start:**
+
+   **Plus-address mode** (recommended):
+   ```bash
+   export GMAIL_ALLOWED_SENDER=you@example.com
+   export GMAIL_TRIGGER_ADDRESS=you+claude@example.com
+   npm run email
+   ```
+   Then forward any email to `you+claude@example.com` — Claude reads it and replies in the same thread.
+
+   **Keyword mode:**
    ```bash
    export GMAIL_ALLOWED_SENDER=you@example.com
    npm run email
    ```
+   Then send yourself an email with subject `CLAUDE: your question`.
 
-4. **Test it:** Send yourself an email with subject `CLAUDE: what time is it?` — you should receive a reply within about 90 seconds.
+4. **Test it:** Forward an email (plus-address mode) or send `CLAUDE: what time is it?` (keyword mode) — you should receive a reply within about 90 seconds.
 
 ### Email commands
 
+**Plus-address mode:**
+* Forward any email to `you+claude@example.com` — subject and body become the prompt
+* `NEW: your question` in the subject — starts a fresh session
+* Reply to a Claude response — continues the conversation
+
+**Keyword mode:**
 * `CLAUDE: your question` — sends the question to Claude
-* `CLAUDE NEW: your question` — starts a fresh session, then sends the question
-* Reply to a Claude response — continues the conversation in the same session
+* `CLAUDE NEW: your question` — starts a fresh session
+* Reply to a Claude response — continues the conversation
 
 ### Email configuration
 
 | Setting | Env var | Default |
 |---------|---------|---------|
 | Allowed sender | `GMAIL_ALLOWED_SENDER` | *(required)* |
+| Trigger address | `GMAIL_TRIGGER_ADDRESS` | *(unset = keyword mode)* |
 | Subject keyword | `GMAIL_KEYWORD` | `CLAUDE` |
 | Poll interval | `GMAIL_POLL_INTERVAL` | `60` seconds |
 | OAuth config dir | `GMAIL_CONFIG_DIR` | `~/.config/gmail-bridge` |
 | Session file | `GMAIL_SESSION_FILE` | `~/.claude-email-session` |
+| Attachment dir | `GMAIL_ATTACHMENT_DIR` | `/tmp/email-bridge-attachments` |
+| Processed IDs | `GMAIL_PROCESSED_FILE` | `~/.email-bridge-processed.json` |
 
 ### Running both bridges
 
@@ -224,7 +267,7 @@ npm start          # Telegram bridge
 npm run email      # Email bridge
 ```
 
-Each bridge maintains its own session UUID, so conversations are independent. Use Telegram for quick back-and-forth; use email for longer, asynchronous requests.
+Each bridge maintains its own session UUID, so conversations are independent. Use Telegram for quick back-and-forth; use email for longer, asynchronous requests or forwarding documents for processing.
 
 ## Configuration
 
