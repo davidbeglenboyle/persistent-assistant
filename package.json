@@ -1,18 +1,21 @@
 {
   "name": "persistent-assistant",
   "version": "0.1.0",
-  "description": "Bridge Telegram messages to Claude Code CLI — full tool access from your phone",
+  "description": "Bridge Telegram or Email to Claude Code CLI — full tool access from your phone",
   "main": "src/index.ts",
   "scripts": {
     "start": "tsx src/index.ts",
-    "dev": "tsx watch src/index.ts"
+    "email": "tsx src/email-bridge.ts",
+    "dev": "tsx watch src/index.ts",
+    "setup-gmail": "tsx scripts/setup-gmail-oauth.ts"
   },
-  "keywords": ["telegram", "claude", "claude-code", "cli", "bridge", "ai-assistant"],
+  "keywords": ["telegram", "email", "gmail", "claude", "claude-code", "cli", "bridge", "ai-assistant"],
   "author": "",
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {
     "@types/node": "^25.2.1",
+    "googleapis": "^144.0.0",
     "grammy": "^1.39.3",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
