@@ -1,26 +1,32 @@
 /**
  * Email-Claude Bridge — main entrypoint.
  *
- * Polls Gmail for unread emails with a configurable keyword in the subject.
+ * Polls Gmail for emails matching a configured trigger (plus-address or subject keyword).
  * Spawns Claude Code per email, replies in the same thread.
+ * Downloads attachments to disk and includes paths in the prompt so Claude can read them.
  *
  * Environment variables:
  *   GMAIL_ALLOWED_SENDER  — email address allowed to trigger the bridge (required)
- *   GMAIL_KEYWORD         — subject prefix to match (default: "CLAUDE")
+ *   GMAIL_TRIGGER_ADDRESS — plus-address trigger, e.g. you+claude@gmail.com (optional)
+ *                           When set, polls for emails TO this address instead of keyword mode
+ *   GMAIL_KEYWORD         — subject prefix to match in keyword mode (default: "CLAUDE")
  *   GMAIL_POLL_INTERVAL   — seconds between polls (default: 60)
  *   GMAIL_SESSION_FILE    — path to session state file (default: ~/.claude-email-session)
  *   GMAIL_CONFIG_DIR      — path to OAuth credentials (default: ~/.config/gmail-bridge)
+ *   GMAIL_ATTACHMENT_DIR  — where to save attachments (default: /tmp/email-bridge-attachments)
  *
  * Start with: npm run email
  */
 
 import {
   pollForEmails,
+  markAsProcessed,
   markAsRead,
   replyToThread,
   extractPrompt,
   isAllowedSender,
   getAuth,
+  type AttachmentInfo,
 } from "./gmail";
 import { runClaude } from "./claude";
 import { enqueue } from "./queue";
@@ -41,6 +47,7 @@ if (!ALLOWED_SENDER) {
   process.exit(1);
 }
 
+const TRIGGER_ADDRESS = process.env.GMAIL_TRIGGER_ADDRESS; // Optional: plus-address mode
 const KEYWORD = process.env.GMAIL_KEYWORD || "CLAUDE";
 const POLL_INTERVAL_MS = (parseInt(process.env.GMAIL_POLL_INTERVAL || "60", 10)) * 1000;
 const SESSION_FILE = process.env.GMAIL_SESSION_FILE ||
@@ -108,24 +115,47 @@ async function processEmail(email: {
   from: string;
   to: string;
   messageId: string;
+  attachments: AttachmentInfo[];
 }): Promise<void> {
   // Security: verify sender
   if (!isAllowedSender(email.from, ALLOWED_SENDER)) {
     console.log(`  REJECTED: email from ${email.from} (not ${ALLOWED_SENDER})`);
-    await markAsRead(email.id);
+    markAsProcessed(email.id);
     return;
   }
 
-  const { prompt, isNewSession } = extractPrompt(email, KEYWORD);
+  const { prompt, isNewSession } = extractPrompt(email, {
+    triggerAddress: TRIGGER_ADDRESS,
+    keyword: KEYWORD,
+  });
 
   if (!prompt.trim()) {
     console.log("  Empty prompt — skipping");
-    await markAsRead(email.id);
+    markAsProcessed(email.id);
     return;
+  }
+
+  // Build attachment context for Claude
+  let fullPrompt = prompt;
+  if (email.attachments.length > 0) {
+    const formatSize = (bytes: number): string => {
+      if (bytes < 1024) return `${bytes}B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`;
+      return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+    };
+
+    const attachmentList = email.attachments.map((a) =>
+      `  - ${a.filename} (${formatSize(a.sizeBytes)}, ${a.mimeType}) → ${a.localPath}`
+    ).join("\n");
+
+    fullPrompt += `\n\n---\nATTACHMENTS SAVED TO DISK:\n${attachmentList}\n\nThese files have been downloaded from the email. You can read them with your Read tool. For large files (>100KB), consider using a sub-agent to summarise them rather than reading directly into your context window.`;
   }
 
   console.log(`  Subject: ${email.subject}`);
   console.log(`  Prompt: ${prompt.slice(0, 100)}${prompt.length > 100 ? "..." : ""}`);
+  if (email.attachments.length > 0) {
+    console.log(`  Attachments: ${email.attachments.length} file(s)`);
+  }
 
   if (isNewSession) {
     const session = newSession();
@@ -138,7 +168,7 @@ async function processEmail(email: {
 
   console.log(`  Session: ${session.sessionId.slice(0, 8)}... (${isFirst ? "new" : "resume"})`);
 
-  const result = await runClaude(session.sessionId, prompt, isFirst);
+  const result = await runClaude(session.sessionId, fullPrompt, isFirst);
 
   if (!result.isError) {
     activeSessions.add(session.sessionId);
@@ -159,7 +189,8 @@ async function processEmail(email: {
     responseText += `\n\nPermission needed for:\n${denials.join("\n")}\nReply to this email with "yes" to approve.`;
   }
 
-  // Mark as read BEFORE replying (so the reply doesn't trigger re-processing)
+  // Mark as processed BEFORE replying (so the reply doesn't trigger re-processing)
+  markAsProcessed(email.id);
   await markAsRead(email.id);
 
   // Reply in the same thread — ONLY to the allowed sender
@@ -176,7 +207,11 @@ async function processEmail(email: {
 
 async function poll(): Promise<void> {
   try {
-    const emails = await pollForEmails(KEYWORD);
+    const emails = await pollForEmails({
+      triggerAddress: TRIGGER_ADDRESS,
+      keyword: KEYWORD,
+      allowedSender: ALLOWED_SENDER,
+    });
 
     if (emails.length > 0) {
       console.log(`\n[${new Date().toLocaleTimeString("en-GB")}] Found ${emails.length} email(s)`);
@@ -212,11 +247,15 @@ async function main(): Promise<void> {
     activeSessions.add(session.sessionId);
   }
 
+  const triggerMode = TRIGGER_ADDRESS
+    ? `plus-address (${TRIGGER_ADDRESS})`
+    : `keyword ("${KEYWORD}:" in subject)`;
+
   console.log(`Email-Claude Bridge starting...`);
   console.log(`Session: ${session.sessionId}`);
   console.log(`Messages so far: ${session.messageCount}`);
   console.log(`Allowed sender: ${ALLOWED_SENDER}`);
-  console.log(`Keyword: ${KEYWORD}`);
+  console.log(`Trigger: ${triggerMode}`);
   console.log(`Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
   console.log();
 
