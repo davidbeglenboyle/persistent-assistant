@@ -280,7 +280,7 @@ Each bridge maintains its own session UUID, so conversations are independent. Us
 | Timeout per message | `src/claude.ts` | 10 minutes |
 | Telegram message limit | `src/bot.ts` | 4,096 characters |
 | Safety prompt | `src/safety-prompt.txt` | Editable text file |
-| Session file | `~/.claude-bridge-session` | Per-machine |
+| Session file | `BRIDGE_SESSION_FILE` env var or `src/session.ts` | `~/.claude-bridge-session` |
 | Working directory | `src/claude.ts` | Home directory |
 
 ## Running in the Background
@@ -462,7 +462,7 @@ launchctl load ~/Library/LaunchAgents/com.persistent-assistant.plist
 
 ### 6. Session state
 
-The session file (`~/.claude-bridge-session`) and Claude Code's conversation history (`~/.claude/projects/`) are both per-machine and do not sync. The new machine starts a fresh session. This is intentional — resuming a session created on a different machine would reference file paths and tool outputs that may not exist locally.
+The session file (`~/.claude-bridge-session`, or the path set in `BRIDGE_SESSION_FILE`) and Claude Code's conversation history (`~/.claude/projects/`) are both per-machine and do not sync. The new machine starts a fresh session. This is intentional — resuming a session created on a different machine would reference file paths and tool outputs that may not exist locally.
 
 ### Known quirks
 

@@ -126,6 +126,7 @@ The safety prompt is **advisory, not enforced**. Claude treats appended system p
 ## Session Management
 
 - Session UUID stored at `~/.claude-bridge-session` (home directory, per-machine)
+- To use a different session file (e.g. for running multiple bridge instances), set `BRIDGE_SESSION_FILE` in `.env` or your environment
 - Session conversation history stored by Claude Code at `~/.claude/projects/`
 - `/new` creates a fresh UUID; old history remains on disk
 - Killing and restarting the bot resumes the same session automatically
