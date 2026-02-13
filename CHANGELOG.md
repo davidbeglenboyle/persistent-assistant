@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-02-13
+
+### Configurable session file path
+- `session.ts` now reads `BRIDGE_SESSION_FILE` env var, falling back to `~/.claude-bridge-session`
+- Allows multiple bridge instances (Telegram, email) to use separate session files
+- Updated `.env.example` with the new variable
+
+### Security documentation
+- Added `SECURITY.md` — comprehensive security analysis covering network exposure, credential risks, and the real threat surface
+- Updated to reflect current `--allowed-tools` safety model
+
 ## 2026-02-09
 
 ### Email bridge — control Claude Code via email

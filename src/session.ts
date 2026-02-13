@@ -3,7 +3,8 @@ import * as crypto from "crypto";
 import * as path from "path";
 import * as os from "os";
 
-const SESSION_FILE = path.join(os.homedir(), ".claude-bridge-session");
+const SESSION_FILE = process.env.BRIDGE_SESSION_FILE
+  || path.join(os.homedir(), ".claude-bridge-session");
 
 interface SessionState {
   sessionId: string;
