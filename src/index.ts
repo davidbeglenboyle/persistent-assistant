@@ -1,27 +1,37 @@
 import { createBot } from "./bot";
-import { getOrCreateSession } from "./session";
+import { getAllSessions } from "./session";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
-const chatId = process.env.TELEGRAM_CHAT_ID;
+const chatIdEnv = process.env.TELEGRAM_CHAT_ID;
+
+// Mode: "dm" for direct messages (backward compatible), "group" for forum topics
+const mode = (process.env.BRIDGE_MODE || "dm") as "dm" | "group";
 
 if (!token) {
   console.error("TELEGRAM_BOT_TOKEN not set");
   process.exit(1);
 }
 
-if (!chatId) {
+if (!chatIdEnv) {
   console.error("TELEGRAM_CHAT_ID not set");
   process.exit(1);
 }
 
-const session = getOrCreateSession();
-console.log(`Telegram-Claude Bridge starting...`);
-console.log(`Session: ${session.sessionId}`);
-console.log(`Messages so far: ${session.messageCount}`);
-console.log(`Allowed chat ID: ${chatId}`);
+// Support multiple chat IDs (comma-separated) for group mode
+// e.g. "12345,-100987654" allows both a DM and a group
+const allowedChatIds = chatIdEnv.split(",").map((id) => Number(id.trim()));
+
+const sessions = getAllSessions();
+console.log(`Telegram-Claude Bridge starting (${mode} mode)...`);
+console.log(`Active sessions: ${sessions.length}`);
+for (const { topicId, state } of sessions) {
+  const label = topicId === "general" ? "General" : `Topic ${topicId}`;
+  console.log(`  ${label}: ${state.sessionId.slice(0, 8)}... (${state.messageCount} msgs)`);
+}
+console.log(`Allowed chat IDs: ${allowedChatIds.join(", ")}`);
 console.log();
 
-const bot = createBot(token, Number(chatId));
+const bot = createBot(token, allowedChatIds, mode);
 
 // Catch middleware errors so grammy doesn't stop the bot and throw
 bot.catch((err) => {
@@ -30,11 +40,11 @@ bot.catch((err) => {
 
 bot.start({
   onStart: (botInfo) => {
-    console.log(`Bot @${botInfo.username} is running. Send messages via Telegram.`);
+    console.log(`Bot @${botInfo.username} is running (${mode} mode). Send messages via Telegram.`);
   },
 }).catch((err) => {
   console.error("Bot polling fatal error:", err);
-  process.exit(1);
+  process.exit(1); // Exit so launchd/systemd restarts
 });
 
 // Safety net — log unhandled rejections but don't crash

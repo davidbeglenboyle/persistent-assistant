@@ -22,7 +22,10 @@ export interface ClaudeResult {
   permissionDenials: PermissionDenial[];
 }
 
-const TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+export type ProgressCallback = (info: { elapsedMin: number; toolCallCount: number }) => void;
+
+const PROGRESS_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const SAFETY_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes — hard safety net
 
 // Tools pre-approved without Telegram confirmation. Bash requires explicit approval.
 const ALLOWED_TOOLS = [
@@ -106,7 +109,8 @@ function spawnClaude(
   sessionId: string,
   message: string,
   useResume: boolean,
-  extraAllowedTools: string[] = []
+  extraAllowedTools: string[] = [],
+  onProgress?: ProgressCallback
 ): Promise<ClaudeResult> {
   return new Promise((resolve) => {
     const tools = [...ALLOWED_TOOLS, ...extraAllowedTools];
@@ -145,15 +149,27 @@ function spawnClaude(
       stderr += chunk.toString();
     });
 
-    const timer = setTimeout(() => {
+    // Progress updates every 5 minutes
+    const startTime = Date.now();
+    let progressToolCount = 0;
+    const progressInterval = onProgress
+      ? setInterval(() => {
+          const elapsedMin = Math.round((Date.now() - startTime) / 60000);
+          onProgress({ elapsedMin, toolCallCount: progressToolCount });
+        }, PROGRESS_INTERVAL_MS)
+      : null;
+
+    // 60-minute hard safety net — prevents truly stuck processes
+    const safetyTimer = setTimeout(() => {
       wasTimedOut = true;
-      console.log("  Timeout reached — killing Claude process");
+      console.log("  Safety timeout (60 min) reached — killing Claude process");
       proc.kill("SIGTERM");
       setTimeout(() => proc.kill("SIGKILL"), 5000);
-    }, TIMEOUT_MS);
+    }, SAFETY_TIMEOUT_MS);
 
     proc.on("close", (code) => {
-      clearTimeout(timer);
+      if (progressInterval) clearInterval(progressInterval);
+      clearTimeout(safetyTimer);
 
       if (code !== 0 && !stdout.trim()) {
         const errorMsg = stderr.trim() || `Claude exited with code ${code}`;
@@ -193,6 +209,7 @@ function spawnClaude(
                   name: block.name,
                   summary: summarizeToolInput(block.name, block.input || {}),
                 });
+                progressToolCount = toolCalls.length;
               }
               if (block.type === "text" && block.text) {
                 assistantText += block.text;
@@ -230,9 +247,9 @@ function spawnClaude(
         let fallbackResult: string;
 
         if (wasTimedOut && assistantText) {
-          fallbackResult = `(Timed out after ${TIMEOUT_MS / 60000} minutes — partial response below)\n\n${assistantText.slice(0, 3800)}`;
+          fallbackResult = `(Timed out after ${SAFETY_TIMEOUT_MS / 60000} minutes — partial response below)\n\n${assistantText.slice(0, 3800)}`;
         } else if (wasTimedOut) {
-          fallbackResult = `(Timed out after ${TIMEOUT_MS / 60000} minutes with no response text. Claude was likely busy with tool calls. You can ask "what did you do?" to get a summary.)`;
+          fallbackResult = `(Timed out after ${SAFETY_TIMEOUT_MS / 60000} minutes with no response text. Claude was likely busy with tool calls. You can ask "what did you do?" to get a summary.)`;
         } else if (assistantText) {
           fallbackResult = assistantText.slice(0, 4000);
         } else {
@@ -251,7 +268,8 @@ function spawnClaude(
     });
 
     proc.on("error", (err) => {
-      clearTimeout(timer);
+      if (progressInterval) clearInterval(progressInterval);
+      clearTimeout(safetyTimer);
       console.log(`  Spawn error: ${err.message}`);
       resolve({
         result: `Spawn error: ${err.message}`,
@@ -271,20 +289,21 @@ export async function runClaude(
   sessionId: string,
   message: string,
   isFirstMessage: boolean,
-  extraAllowedTools: string[] = []
+  extraAllowedTools: string[] = [],
+  onProgress?: ProgressCallback
 ): Promise<ClaudeResult> {
-  const result = await spawnClaude(sessionId, message, !isFirstMessage, extraAllowedTools);
+  const result = await spawnClaude(sessionId, message, !isFirstMessage, extraAllowedTools, onProgress);
 
   // If --session-id failed because session exists, retry with --resume
   if (result.isError && result.result.includes("already in use")) {
     console.log("  Session exists — retrying with --resume");
-    return spawnClaude(sessionId, message, true, extraAllowedTools);
+    return spawnClaude(sessionId, message, true, extraAllowedTools, onProgress);
   }
 
   // If --resume failed because session doesn't exist, retry with --session-id
   if (result.isError && result.result.includes("No session found")) {
     console.log("  Session not found — retrying with --session-id");
-    return spawnClaude(sessionId, message, false, extraAllowedTools);
+    return spawnClaude(sessionId, message, false, extraAllowedTools, onProgress);
   }
 
   return result;

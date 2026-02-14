@@ -26,14 +26,16 @@ function timeStamp(): string {
 export function logExchange(
   userMessage: string,
   claudeResponse: string,
-  toolCalls: ToolCall[] = []
+  toolCalls: ToolCall[] = [],
+  topicId: string = "general"
 ): void {
   ensureLogsDir();
   const file = todayFile();
   const time = timeStamp();
+  const topicLabel = topicId === "general" ? "" : ` [Topic ${topicId}]`;
 
   const parts = [
-    `## ${time}`,
+    `## ${time}${topicLabel}`,
     "",
     `**User:** ${userMessage}`,
     "",
