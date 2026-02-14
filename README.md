@@ -50,14 +50,18 @@ Long-polling means the bot works behind NAT, firewalls, and home routers without
 
 * **Full Claude Code capabilities** — File editing, bash commands, git operations, MCP servers, web search, everything Claude Code can do
 * **Session persistence** — Conversation context preserved across messages via `--resume`
+* **Forum/topic support** — Run in a Telegram forum group with separate Claude sessions per topic
+* **Photo support** — Send images via Telegram for Claude to analyse using its multimodal Read tool
+* **Update deduplication** — Prevents message replay on bot restarts
+* **Progress updates** — Long-running tasks send "Still working..." updates every 5 minutes
 * **Enforced tool permissions** — `--allowed-tools` whitelist pre-approves safe tools; denied tools are surfaced via Telegram for approval
 * **Safety prompt** — An advisory system prompt that requires Claude to ask for confirmation before destructive actions (file deletion, force push, sending emails, etc.)
 * **Chat ID whitelist** — Only your Telegram account can talk to the bot
 * **Auto-split long responses** — Messages longer than Telegram's 4,096-character limit are split automatically
-* **Daily conversation logs** — Every exchange logged to `logs/YYYY-MM-DD.md`
+* **Daily conversation logs** — Every exchange logged to `logs/YYYY-MM-DD.md` with topic labels
 * **Typing indicator** — Shows "typing..." in Telegram while Claude processes
-* **FIFO message queue** — Messages processed one at a time; send multiple and they queue up
-* **Telegram commands** — `/new` to start a fresh session, `/status` to check session info
+* **Per-topic FIFO queues** — Messages within a topic are sequential; different topics process in parallel
+* **Telegram commands** — `/new` to start a fresh session, `/status` to check session info, `/topics` to list all active topics
 
 ## Quick Start
 
@@ -106,12 +110,14 @@ persistent-assistant/
 ├── src/
 │   ├── index.ts              # Telegram bridge entry point
 │   ├── email-bridge.ts       # Email bridge entry point
-│   ├── bot.ts                # Telegram bot (grammy, long-polling)
+│   ├── bot.ts                # Telegram bot (grammy, long-polling, text + photo handlers)
 │   ├── gmail.ts              # Gmail API client (poll, read, download attachments, reply)
 │   ├── claude.ts             # Spawns Claude Code CLI, parses JSON response (shared)
-│   ├── queue.ts              # Promise-based FIFO queue (shared)
-│   ├── session.ts            # Session UUID persistence (shared)
-│   ├── logger.ts             # Daily conversation logs (shared)
+│   ├── queue.ts              # Per-topic FIFO queues (shared)
+│   ├── session.ts            # Per-topic session persistence (shared)
+│   ├── logger.ts             # Daily conversation logs with topic labels (shared)
+│   ├── download.ts           # Download Telegram photos to /tmp/ + auto-cleanup
+│   ├── dedup.ts              # Update deduplication (prevents restart replay)
 │   ├── safety-prompt.txt     # Telegram safety rules (editable)
 │   └── email-safety-prompt.txt  # Email safety rules (editable)
 ├── scripts/
@@ -122,7 +128,7 @@ persistent-assistant/
 └── package.json
 ```
 
-The Telegram and Email bridges share `claude.ts` (CLI spawner), `queue.ts` (FIFO), and `logger.ts` (daily logs). Each has its own entry point and safety prompt.
+The Telegram and Email bridges share `claude.ts` (CLI spawner), `queue.ts` (per-topic FIFO), `session.ts` (per-topic sessions), and `logger.ts` (daily logs). Each has its own entry point and safety prompt.
 
 ### Two-layer safety model
 
@@ -145,6 +151,52 @@ The file `src/safety-prompt.txt` is injected into every invocation via `--append
 Both layers use the same confirmation flow: Claude asks "should I proceed?", you reply "yes" on Telegram, and the next `--resume` invocation picks up the context and executes.
 
 You can edit `src/safety-prompt.txt` to add your own rules without touching any TypeScript.
+
+## Forum/Topic Mode
+
+By default, the bridge runs in DM mode — one session for direct messages. To run in a Telegram forum group with separate topics, set `BRIDGE_MODE=group`.
+
+### Setting up a forum group
+
+1. Create a Telegram group and enable "Topics" in group settings
+2. Create topics for different contexts (e.g. "Work", "Personal", "Admin")
+3. Add your bot to the group and make it an admin
+4. Get the group's chat ID (it will be a negative number like `-100123456789`)
+5. Set your environment variables:
+   ```bash
+   export TELEGRAM_CHAT_ID="-100123456789"
+   export BRIDGE_MODE=group
+   ```
+
+### How topics work
+
+Each topic in the forum group gets its own isolated Claude session. Messages in one topic have no visibility into conversations in other topics. This is useful for maintaining separate contexts — a "Work" topic keeps your work conversations separate from a "Personal" topic.
+
+Topics are processed in parallel — a long-running task in one topic does not block other topics. Within each topic, messages are queued and processed sequentially (safe for `--resume`).
+
+The General topic in Telegram forum groups has a quirk: the Bot API sometimes omits `message_thread_id` for it. The bridge handles this by routing those messages to a dedicated `"general-topic"` session rather than the DM catch-all.
+
+### Topic commands
+
+* `/new` — Starts a fresh session for the current topic only (other topics unaffected)
+* `/status` — Shows session info for the current topic
+* `/topics` — Lists all active topics with message counts
+
+### Multiple chat IDs
+
+You can allow multiple chats (e.g. both a DM and a group) by comma-separating the IDs:
+
+```bash
+export TELEGRAM_CHAT_ID="123456789,-100987654321"
+```
+
+## Photo Support
+
+Send photos via Telegram and Claude will analyse them using its multimodal Read tool. Photos are downloaded to `/tmp/telegram-bridge-images/` and cleaned up automatically after 24 hours.
+
+* Include a caption with the photo to provide context
+* The highest resolution version is always selected
+* Photos work in both DM and forum/topic modes
 
 ## Email Bridge
 
@@ -276,11 +328,13 @@ Each bridge maintains its own session UUID, so conversations are independent. Us
 | Setting | Location | Default |
 |---------|----------|---------|
 | Claude binary path | `CLAUDE_PATH` env var | Auto-detected |
+| Bridge mode | `BRIDGE_MODE` env var | `dm` |
 | Tool whitelist | `ALLOWED_TOOLS` in `src/claude.ts` | All built-in tools except Bash |
-| Timeout per message | `src/claude.ts` | 10 minutes |
+| Safety timeout | `src/claude.ts` | 60 minutes (progress every 5 min) |
 | Telegram message limit | `src/bot.ts` | 4,096 characters |
 | Safety prompt | `src/safety-prompt.txt` | Editable text file |
-| Session file | `BRIDGE_SESSION_FILE` env var or `src/session.ts` | `~/.claude-bridge-session` |
+| Sessions directory | `BRIDGE_SESSIONS_DIR` env var | `~/.claude-bridge-sessions` |
+| Legacy session file | `BRIDGE_SESSION_FILE` env var | `~/.claude-bridge-session` (auto-migrated) |
 | Working directory | `src/claude.ts` | Home directory |
 
 ## Running in the Background

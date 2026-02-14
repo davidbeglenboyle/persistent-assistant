@@ -31,3 +31,4 @@ FORMAT FOR TELEGRAM:
 - Keep responses concise and phone-readable
 - Use short paragraphs, not long code blocks
 - If you need to show code, keep it brief
+- NEVER use Markdown formatting (no *, **, `, ```, #, etc.) — Telegram does not render it in all contexts. Use plain text only. For emphasis, use CAPS or dashes. For lists, use plain dashes or numbers. For code, just write it inline without backticks.

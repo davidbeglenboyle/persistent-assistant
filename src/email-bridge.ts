@@ -39,7 +39,7 @@ import * as os from "os";
 
 // --- Configuration from environment ---
 
-const ALLOWED_SENDER = process.env.GMAIL_ALLOWED_SENDER;
+const ALLOWED_SENDER: string = process.env.GMAIL_ALLOWED_SENDER || "";
 if (!ALLOWED_SENDER) {
   console.error("GMAIL_ALLOWED_SENDER not set");
   console.error("Set this to your email address, e.g.:");
@@ -176,7 +176,7 @@ async function processEmail(email: {
   }
 
   // Log the exchange
-  logExchange(email.subject, result.result, result.toolCalls);
+  logExchange(email.subject, result.result, result.toolCalls, "email");
 
   // Build response
   let responseText = result.result;
@@ -218,7 +218,7 @@ async function poll(): Promise<void> {
 
       // Process oldest first (Gmail returns newest first)
       for (const email of emails.reverse()) {
-        await enqueue(async () => {
+        await enqueue("email", async () => {
           await processEmail(email);
         });
       }

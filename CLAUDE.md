@@ -106,8 +106,9 @@ Tell the user to send a test message via Telegram. They should receive a respons
 
 ## Telegram Commands
 
-- `/new` — Start a fresh Claude session. Old session history remains on disk but is no longer resumed.
-- `/status` — Show current session ID, creation time, message count, and queue depth.
+- `/new` — Start a fresh Claude session for the current topic. Old session history remains on disk but is no longer resumed.
+- `/status` — Show current session ID, creation time, message count, and queue depth for the current topic.
+- `/topics` — List all active topics with message counts (useful in forum/group mode).
 
 ## Safety Prompt
 
@@ -125,11 +126,14 @@ The safety prompt is **advisory, not enforced**. Claude treats appended system p
 
 ## Session Management
 
-- Session UUID stored at `~/.claude-bridge-session` (home directory, per-machine)
-- To use a different session file (e.g. for running multiple bridge instances), set `BRIDGE_SESSION_FILE` in `.env` or your environment
+- Sessions stored in `~/.claude-bridge-sessions/` directory (one JSON file per topic)
+- To use a different directory, set `BRIDGE_SESSIONS_DIR` in `.env` or your environment
+- Legacy single-file sessions (`~/.claude-bridge-session`) are auto-migrated on first run
+- In DM mode, all messages use the "general" topic; in group mode, each forum topic gets its own session
 - Session conversation history stored by Claude Code at `~/.claude/projects/`
-- `/new` creates a fresh UUID; old history remains on disk
-- Killing and restarting the bot resumes the same session automatically
+- `/new` creates a fresh UUID for the current topic; old history remains on disk
+- Killing and restarting the bot resumes all sessions automatically
+- Update deduplication prevents message replay on restart (tracked in `_processed_updates.json`)
 
 ## Working Directory
 
@@ -166,7 +170,7 @@ which claude
 Your Telegram chat ID doesn't match the `TELEGRAM_CHAT_ID` value. Double-check it with @userinfobot.
 
 ### Messages timing out
-Default timeout is 10 minutes. Complex tasks (large file operations, long-running commands) may exceed this. To increase, edit `TIMEOUT_MS` in `src/claude.ts`.
+The hard safety timeout is 60 minutes, with progress updates sent every 5 minutes. Progress messages show elapsed time and tool call count. To adjust, edit `SAFETY_TIMEOUT_MS` or `PROGRESS_INTERVAL_MS` in `src/claude.ts`.
 
 ### "TELEGRAM_BOT_TOKEN not set"
 Credentials not loaded. Check:
