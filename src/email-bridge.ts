@@ -4,6 +4,7 @@
  * Polls Gmail for emails matching a configured trigger (plus-address or subject keyword).
  * Spawns Claude Code per email, replies in the same thread.
  * Downloads attachments to disk and includes paths in the prompt so Claude can read them.
+ * Each unique subject line gets its own Claude session (Re:/Fwd: stripped).
  *
  * Environment variables:
  *   GMAIL_ALLOWED_SENDER  — email address allowed to trigger the bridge (required)
@@ -11,7 +12,7 @@
  *                           When set, polls for emails TO this address instead of keyword mode
  *   GMAIL_KEYWORD         — subject prefix to match in keyword mode (default: "CLAUDE")
  *   GMAIL_POLL_INTERVAL   — seconds between polls (default: 60)
- *   GMAIL_SESSION_FILE    — path to session state file (default: ~/.claude-email-session)
+ *   GMAIL_SESSIONS_FILE   — path to sessions state file (default: ~/.claude-email-sessions.json)
  *   GMAIL_CONFIG_DIR      — path to OAuth credentials (default: ~/.config/gmail-bridge)
  *   GMAIL_ATTACHMENT_DIR  — where to save attachments (default: /tmp/email-bridge-attachments)
  *
@@ -25,6 +26,7 @@ import {
   replyToThread,
   extractPrompt,
   isAllowedSender,
+  subjectToKey,
   getAuth,
   type AttachmentInfo,
 } from "./gmail";
@@ -50,55 +52,67 @@ if (!ALLOWED_SENDER) {
 const TRIGGER_ADDRESS = process.env.GMAIL_TRIGGER_ADDRESS; // Optional: plus-address mode
 const KEYWORD = process.env.GMAIL_KEYWORD || "CLAUDE";
 const POLL_INTERVAL_MS = (parseInt(process.env.GMAIL_POLL_INTERVAL || "60", 10)) * 1000;
-const SESSION_FILE = process.env.GMAIL_SESSION_FILE ||
-  path.join(os.homedir(), ".claude-email-session");
+const SESSIONS_FILE = process.env.GMAIL_SESSIONS_FILE ||
+  path.join(os.homedir(), ".claude-email-sessions.json");
 
-// --- Session management (separate from Telegram) ---
+// --- Per-subject session management ---
 
 interface SessionState {
   sessionId: string;
   createdAt: string;
   messageCount: number;
+  subject: string;
 }
 
-function loadSession(): SessionState | null {
+interface SessionsMap {
+  [subjectKey: string]: SessionState;
+}
+
+function loadSessions(): SessionsMap {
   try {
-    return JSON.parse(fs.readFileSync(SESSION_FILE, "utf-8"));
+    return JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8"));
   } catch {
-    return null;
+    return {};
   }
 }
 
-function saveSession(state: SessionState): void {
-  fs.writeFileSync(SESSION_FILE, JSON.stringify(state, null, 2));
+function saveSessions(sessions: SessionsMap): void {
+  fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
 }
 
-function getOrCreateSession(): SessionState {
-  const existing = loadSession();
-  if (existing) return existing;
+function getOrCreateSession(sKey: string, rawSubject: string): SessionState {
+  const sessions = loadSessions();
+  if (sessions[sKey]) return sessions[sKey];
   const state: SessionState = {
     sessionId: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
     messageCount: 0,
+    subject: rawSubject,
   };
-  saveSession(state);
+  sessions[sKey] = state;
+  saveSessions(sessions);
   return state;
 }
 
-function newSession(): SessionState {
+function newSession(sKey: string, rawSubject: string): SessionState {
+  const sessions = loadSessions();
   const state: SessionState = {
     sessionId: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
     messageCount: 0,
+    subject: rawSubject,
   };
-  saveSession(state);
+  sessions[sKey] = state;
+  saveSessions(sessions);
   return state;
 }
 
-function incrementMessage(): void {
-  const state = getOrCreateSession();
+function incrementMessage(sKey: string): void {
+  const sessions = loadSessions();
+  const state = sessions[sKey];
+  if (!state) return;
   state.messageCount++;
-  saveSession(state);
+  saveSessions(sessions);
 }
 
 // --- Active session tracking ---
@@ -135,6 +149,9 @@ async function processEmail(email: {
     return;
   }
 
+  // Derive session key from subject line
+  const sKey = subjectToKey(email.subject, TRIGGER_ADDRESS ? undefined : KEYWORD);
+
   // Build attachment context for Claude
   let fullPrompt = prompt;
   if (email.attachments.length > 0) {
@@ -152,27 +169,29 @@ async function processEmail(email: {
   }
 
   console.log(`  Subject: ${email.subject}`);
+  console.log(`  Session key: "${sKey}"`);
   console.log(`  Prompt: ${prompt.slice(0, 100)}${prompt.length > 100 ? "..." : ""}`);
   if (email.attachments.length > 0) {
     console.log(`  Attachments: ${email.attachments.length} file(s)`);
   }
 
+  // Handle explicit NEW: session request (forces fresh session for this subject)
   if (isNewSession) {
-    const session = newSession();
+    const session = newSession(sKey, email.subject);
     activeSessions.delete(session.sessionId);
-    console.log(`  New session: ${session.sessionId}`);
+    console.log(`  New session (forced): ${session.sessionId}`);
   }
 
-  const session = getOrCreateSession();
+  const session = getOrCreateSession(sKey, email.subject);
   const isFirst = !activeSessions.has(session.sessionId);
 
-  console.log(`  Session: ${session.sessionId.slice(0, 8)}... (${isFirst ? "new" : "resume"})`);
+  console.log(`  Session: ${session.sessionId.slice(0, 8)}... (${isFirst ? "new" : "resume"}, ${session.messageCount} msgs)`);
 
   const result = await runClaude(session.sessionId, fullPrompt, isFirst);
 
   if (!result.isError) {
     activeSessions.add(session.sessionId);
-    incrementMessage();
+    incrementMessage(sKey);
   }
 
   // Log the exchange
@@ -242,9 +261,13 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const session = getOrCreateSession();
-  if (session.messageCount > 0) {
-    activeSessions.add(session.sessionId);
+  // Load existing sessions and pre-populate activeSessions
+  const sessions = loadSessions();
+  const sessionCount = Object.keys(sessions).length;
+  for (const state of Object.values(sessions)) {
+    if (state.messageCount > 0) {
+      activeSessions.add(state.sessionId);
+    }
   }
 
   const triggerMode = TRIGGER_ADDRESS
@@ -252,8 +275,7 @@ async function main(): Promise<void> {
     : `keyword ("${KEYWORD}:" in subject)`;
 
   console.log(`Email-Claude Bridge starting...`);
-  console.log(`Session: ${session.sessionId}`);
-  console.log(`Messages so far: ${session.messageCount}`);
+  console.log(`Active sessions: ${sessionCount}`);
   console.log(`Allowed sender: ${ALLOWED_SENDER}`);
   console.log(`Trigger: ${triggerMode}`);
   console.log(`Poll interval: ${POLL_INTERVAL_MS / 1000}s`);

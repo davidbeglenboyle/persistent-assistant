@@ -395,6 +395,29 @@ export async function replyToThread(
 }
 
 /**
+ * Normalise a subject line into a session key.
+ * Strips Re:/Fwd:/Fw: prefixes, NEW: prefix, keyword prefix, and lowercases.
+ * Used to route emails with the same subject to the same Claude session.
+ */
+export function subjectToKey(subject: string, keyword?: string): string {
+  let s = subject;
+  // Strip Re:/Fwd:/Fw: prefixes (may be nested)
+  for (let i = 0; i < 5; i++) {
+    const stripped = s.replace(/^(Re:|Fwd?:)\s*/gi, "").trim();
+    if (stripped === s) break;
+    s = stripped;
+  }
+  // Strip NEW: prefix — session control keyword, not part of the subject
+  s = s.replace(/^NEW\s*:\s*/i, "").trim();
+  // Strip keyword prefix (e.g. "CLAUDE:") if in keyword mode
+  if (keyword) {
+    const kwPattern = new RegExp(`^${keyword}\\s*:?\\s*`, "i");
+    s = s.replace(kwPattern, "").trim();
+  }
+  return s.toLowerCase();
+}
+
+/**
  * Extract the prompt from the email subject and body.
  *
  * Plus-address mode: subject becomes the prompt directly (strips Re:/Fwd: only).

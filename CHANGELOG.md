@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-02-15
+
+### Per-subject email sessions — each subject gets its own Claude session
+- Email bridge now routes each unique subject line to its own Claude session
+- Subject normalisation strips `Re:`, `Fwd:`, `Fw:`, keyword prefixes, and `NEW:` before matching, then lowercases — so `Re: Fwd: Check the data` maps to the same session as `check the data`
+- New `subjectToKey()` helper in `gmail.ts` for consistent subject normalisation
+- Session state moved from single-file (`~/.claude-email-session`) to a JSON map (`~/.claude-email-sessions.json`) keyed by normalised subject
+- `NEW:` prefix now forces a fresh session for that specific subject (previously reset the single global session)
+- Env var renamed: `GMAIL_SESSION_FILE` → `GMAIL_SESSIONS_FILE`
+- Startup log now shows active session count instead of a single session ID
+
 ## 2026-02-14
 
 ### Forum/topic support — use Claude in Telegram forum groups

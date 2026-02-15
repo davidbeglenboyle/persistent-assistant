@@ -206,7 +206,7 @@ The project also includes an email bridge (`src/email-bridge.ts`) that polls Gma
 4. Setting `GMAIL_ALLOWED_SENDER` to the user's email address
 5. Starting with `npm run email`
 
-The email bridge reuses `claude.ts`, `queue.ts`, and `logger.ts` from the Telegram bridge. It has its own safety prompt at `src/email-safety-prompt.txt` and its own session file (default: `~/.claude-email-session`).
+The email bridge reuses `claude.ts`, `queue.ts`, and `logger.ts` from the Telegram bridge. It has its own safety prompt at `src/email-safety-prompt.txt` and its own per-subject sessions file (default: `~/.claude-email-sessions.json`). Each unique subject line gets its own Claude session — `Re:` and `Fwd:` prefixes are stripped so replies continue the same session.
 
 ## Important Notes for Agents
 
