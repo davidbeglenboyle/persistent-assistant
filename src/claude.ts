@@ -294,10 +294,22 @@ export async function runClaude(
 ): Promise<ClaudeResult> {
   const result = await spawnClaude(sessionId, message, !isFirstMessage, extraAllowedTools, onProgress);
 
-  // If --session-id failed because session exists, retry with --resume
+  // If session is locked by a previous Claude process, wait and retry once
   if (result.isError && result.result.includes("already in use")) {
-    console.log("  Session exists — retrying with --resume");
-    return spawnClaude(sessionId, message, true, extraAllowedTools, onProgress);
+    console.log("  Session in use — waiting 10s for previous process to finish");
+    await new Promise(r => setTimeout(r, 10000));
+    const retry = await spawnClaude(sessionId, message, true, extraAllowedTools, onProgress);
+    if (!retry.isError) return retry;
+    // Still locked — return friendly error instead of looping
+    console.log("  Session still in use after wait — returning error");
+    return {
+      result: "Session is busy (a previous request is still processing). Please try again in a few minutes.",
+      sessionId,
+      durationMs: 0,
+      isError: true,
+      toolCalls: [],
+      permissionDenials: [],
+    };
   }
 
   // If --resume failed because session doesn't exist, retry with --session-id

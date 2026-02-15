@@ -315,9 +315,10 @@ export function createBot(
       const claudeMessage = parts.join("");
       const logLabel = caption ? `[Photo] ${caption}` : "[Photo]";
 
+      markProcessed(updateId); // Acknowledge before processing — prevents replay on crash
       await processAndRespond(ctx, claudeMessage, logLabel);
-      markProcessed(updateId);
     } catch (err) {
+      markProcessed(updateId); // Also mark on download error — don't retry broken downloads
       console.error(`  [${topicLabel}] Photo download error:`, err);
       try {
         await reply(ctx, `Failed to process photo: ${err instanceof Error ? err.message : String(err)}`);
@@ -357,8 +358,8 @@ export function createBot(
 
     console.log(`\n[${topicLabel}] Message received: ${cleanMessage.slice(0, 100)}...`);
 
+    markProcessed(updateId); // Acknowledge before processing — prevents replay on crash
     await processAndRespond(ctx, cleanMessage, cleanMessage);
-    markProcessed(updateId);
   });
 
   return bot;

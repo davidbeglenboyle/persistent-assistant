@@ -26,7 +26,7 @@ console.log(`Telegram-Claude Bridge starting (${mode} mode)...`);
 console.log(`Active sessions: ${sessions.length}`);
 for (const { topicId, state } of sessions) {
   const label = topicId === "general" ? "General" : `Topic ${topicId}`;
-  console.log(`  ${label}: ${state.sessionId.slice(0, 8)}... (${state.messageCount} msgs)`);
+  console.log(`  ${label}: ${state.sessionId?.slice(0, 8) ?? '???'}... (${state.messageCount ?? 0} msgs)`);
 }
 console.log(`Allowed chat IDs: ${allowedChatIds.join(", ")}`);
 console.log();
@@ -38,14 +38,17 @@ bot.catch((err) => {
   console.error(`Error handling update ${err.ctx?.update?.update_id}:`, err.error);
 });
 
-bot.start({
-  onStart: (botInfo) => {
-    console.log(`Bot @${botInfo.username} is running (${mode} mode). Send messages via Telegram.`);
-  },
-}).catch((err) => {
-  console.error("Bot polling fatal error:", err);
-  process.exit(1); // Exit so launchd/systemd restarts
-});
+// Delay startup to let any previous instance's Telegram connection time out (avoids 409 conflict)
+setTimeout(() => {
+  bot.start({
+    onStart: (botInfo) => {
+      console.log(`Bot @${botInfo.username} is running (${mode} mode). Send messages via Telegram.`);
+    },
+  }).catch((err) => {
+    console.error("Bot polling fatal error:", err);
+    process.exit(1); // Exit so launchd/systemd restarts
+  });
+}, 5000);
 
 // Safety net — log unhandled rejections but don't crash
 process.on("unhandledRejection", (reason) => {
