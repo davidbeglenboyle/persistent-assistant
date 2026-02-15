@@ -282,17 +282,25 @@ Attachments are stored in `/tmp`, so they are automatically cleaned on reboot.
 
 4. **Test it:** Forward an email (plus-address mode) or send `CLAUDE: what time is it?` (keyword mode) — you should receive a reply within about 90 seconds.
 
+### Per-subject sessions
+
+Each unique subject line gets its own Claude session. Replying to an email thread continues that subject's session, while a new subject starts a fresh one. Subject normalisation strips `Re:`, `Fwd:`, `Fw:`, and keyword prefixes so that `Re: Fwd: Check the data` routes to the same session as `Check the data`.
+
+Sessions are stored in a JSON map at `~/.claude-email-sessions.json` (configurable via `GMAIL_SESSIONS_FILE`).
+
+To force a fresh session for a subject that has become stale, prefix the subject with `NEW:` (plus-address mode) or `KEYWORD NEW:` (keyword mode).
+
 ### Email commands
 
 **Plus-address mode:**
 * Forward any email to `you+claude@example.com` — subject and body become the prompt
-* `NEW: your question` in the subject — starts a fresh session
-* Reply to a Claude response — continues the conversation
+* `NEW: your question` in the subject — forces a fresh session for this subject
+* Reply to a Claude response — continues that subject's session
 
 **Keyword mode:**
 * `CLAUDE: your question` — sends the question to Claude
-* `CLAUDE NEW: your question` — starts a fresh session
-* Reply to a Claude response — continues the conversation
+* `CLAUDE NEW: your question` — forces a fresh session for this subject
+* Reply to a Claude response — continues that subject's session
 
 ### Email configuration
 
@@ -303,7 +311,7 @@ Attachments are stored in `/tmp`, so they are automatically cleaned on reboot.
 | Subject keyword | `GMAIL_KEYWORD` | `CLAUDE` |
 | Poll interval | `GMAIL_POLL_INTERVAL` | `60` seconds |
 | OAuth config dir | `GMAIL_CONFIG_DIR` | `~/.config/gmail-bridge` |
-| Session file | `GMAIL_SESSION_FILE` | `~/.claude-email-session` |
+| Sessions file | `GMAIL_SESSIONS_FILE` | `~/.claude-email-sessions.json` |
 | Attachment dir | `GMAIL_ATTACHMENT_DIR` | `/tmp/email-bridge-attachments` |
 | Processed IDs | `GMAIL_PROCESSED_FILE` | `~/.email-bridge-processed.json` |
 
