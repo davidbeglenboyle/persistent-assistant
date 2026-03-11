@@ -1,5 +1,66 @@
 # Changelog
 
+## 2026-03-11
+
+### Production reliability — timeout hierarchy, dead session recovery, media support
+
+Months of production operation surfaced failure modes that are now handled systematically. These changes reflect real-world fixes from running the bridge 24/7 as a macOS LaunchAgent.
+
+#### Three-layer timeout hierarchy (claude.ts)
+- **5-minute no-output timeout**: Kills processes that produce zero stdout. Successful calls produce first output within 30 seconds; hanging calls produce nothing ever. This bimodal distribution means 5 minutes is 10x the slowest success, cutting worst-case wait from 60 to 10 minutes.
+- **60-minute safety timeout**: Hard cap for all processes, regardless of output. Catches legitimate-but-stuck operations.
+- **65-minute queue timeout** (queue.ts): Defense-in-depth. Catches the theoretical edge case where a spawn promise never resolves.
+
+#### Dead session detection and recovery
+- Claude CLI exits instantly with zero output when a session hits its context limit. The bridge now detects this (`deadSession` flag) and signals the caller to rotate to a fresh session.
+- Both Telegram and email bridges auto-rotate: create a new session UUID and retry once.
+
+#### Retry logic (claude.ts)
+Five conditions checked in order after each spawn, each fires at most once:
+1. "already in use" — wait 10s, retry with `--resume`
+2. "No session found" — retry with `--session-id`
+3. Zero-output exit — retry with `--session-id`
+4. No-output timeout (5-min timer) — retry with `--session-id`
+5. Dead session — signal to caller (no retry in claude.ts)
+
+#### Auto-diagnostics
+After 3+ consecutive failures, inline diagnostics check Claude CLI version, competing processes, disk space, and session directory. Results logged to console. 30-minute cooldown between runs.
+
+#### 409 conflict recovery (index.ts)
+When the bridge restarts, Telegram's long-poll timeout is 30 seconds. If the new instance starts polling before the old connection expires, Telegram rejects with 409 Conflict. Fix: 35-second initial delay, `deleteWebhook` call, and retry loop (5 attempts).
+
+#### Heartbeat logging
+Both bridges now log periodic heartbeats (Telegram: every 30 minutes with uptime and queue depth; email: every 10 polls). A running bridge no longer looks identical to a dead one.
+
+#### Health check on startup
+Telegram bridge runs `claude --version` before polling to catch CLI issues early.
+
+#### Media support (bot.ts)
+- **Outbound file sending**: Claude can include `SEND_IMAGE:`, `SEND_DOCUMENT:`, `SEND_AUDIO:`, `SEND_VIDEO:` markers in responses. The bridge strips markers, sends files via Telegram API, then sends remaining text. Size limits enforced (10MB photos, 50MB others).
+- **Inbound media handlers**: Document, audio, voice, video, and video note handlers — not just photos. Files are downloaded and paths passed to Claude.
+
+#### General topic redirect (bot.ts)
+Messages accidentally sent to the General topic in forum groups are caught and redirected with a list of active topics.
+
+#### Email bridge reliability (email-bridge.ts)
+- **Rate limiting**: Max 3 invocations per subject per 5-minute window. Prevents processing loops.
+- **Deferred retry queue**: Capacity errors (too many concurrent processes) suppress the error reply and defer for 5-minute cooldown, max 3 attempts.
+- **Exponential backoff**: Network errors (DNS failures, API timeouts) trigger doubling backoff up to 5 minutes, with recovery logging.
+- **Race condition fix**: `markAsProcessed` called before queueing, not inside `processEmail`. Prevents the next poll from re-discovering emails during slow queue processing.
+
+#### Gmail improvements (gmail.ts)
+- **HTML replies**: Responses sent as HTML to prevent Gmail's 76-char line wrapping in plain text.
+- **RFC 2047 subject encoding**: Non-ASCII subjects properly encoded.
+- **30KB body cap**: Extremely long forwarded threads truncated to prevent context overflow.
+- **Nested MIME part flattening**: Finds text/plain in deeply nested multipart structures.
+
+#### Safety prompt updates
+- Telegram: Added file sending marker documentation.
+- Email: Added attachment handling guidance, response rules, and privacy rule.
+
+#### Clean environment for Claude spawning
+Strips inherited `CLAUDE*` environment variables before spawning to prevent nested-session detection or other interference.
+
 ## 2026-02-15
 
 ### Per-subject email sessions — each subject gets its own Claude session

@@ -32,3 +32,25 @@ FORMAT FOR TELEGRAM:
 - Use short paragraphs, not long code blocks
 - If you need to show code, keep it brief
 - NEVER use Markdown formatting (no *, **, `, ```, #, etc.) — Telegram does not render it in all contexts. Use plain text only. For emphasis, use CAPS or dashes. For lists, use plain dashes or numbers. For code, just write it inline without backticks.
+
+SENDING FILES TO TELEGRAM:
+You can send images, documents, audio, and video back to the user via Telegram. Include a marker on its own line in your response text. The bridge will strip the marker, send the file via Telegram's API, then send any remaining text.
+
+Marker format:
+  SEND_IMAGE:/path/to/file.png
+  SEND_IMAGE:/path/to/file.jpg|Optional caption
+  SEND_DOCUMENT:/path/to/report.pdf
+  SEND_DOCUMENT:/path/to/data.csv|Here is the data
+  SEND_AUDIO:/path/to/track.mp3
+  SEND_VIDEO:/path/to/clip.mp4
+
+Rules:
+- The path must be an absolute path to a file on disk
+- Use SEND_IMAGE for jpg, png, gif, webp (max 10MB)
+- Use SEND_DOCUMENT for pdf, docx, xlsx, csv, zip, and other files (max 50MB)
+- Use SEND_AUDIO for mp3, m4a, ogg, wav
+- Use SEND_VIDEO for mp4, mov
+- You can include multiple markers (one per line) to send multiple files
+- The optional caption after | is shown below the file in Telegram
+- If the file doesn't exist or exceeds size limits, the error appears in the text response
+- Create the file first (chart, document, export), then include the marker

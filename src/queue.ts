@@ -8,6 +8,9 @@ type Task<T> = {
 const queues = new Map<string, Task<unknown>[]>();
 const processing = new Set<string>();
 
+// Defense-in-depth: queue-level timeout slightly exceeds claude.ts 60min safety timer
+const QUEUE_TASK_TIMEOUT_MS = 65 * 60 * 1000;
+
 async function processQueue(topicId: string): Promise<void> {
   if (processing.has(topicId)) return;
   processing.add(topicId);
@@ -16,7 +19,10 @@ async function processQueue(topicId: string): Promise<void> {
   while (queue && queue.length > 0) {
     const task = queue.shift()!;
     try {
-      const result = await task.fn();
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Queue task timed out after 65 minutes")), QUEUE_TASK_TIMEOUT_MS),
+      );
+      const result = await Promise.race([task.fn(), timeout]);
       task.resolve(result);
     } catch (err) {
       task.reject(err);
