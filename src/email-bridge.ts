@@ -55,6 +55,72 @@ const POLL_INTERVAL_MS = (parseInt(process.env.GMAIL_POLL_INTERVAL || "60", 10))
 const SESSIONS_FILE = process.env.GMAIL_SESSIONS_FILE ||
   path.join(os.homedir(), ".claude-email-sessions.json");
 
+// --- Rate limiting ---
+
+const RATE_WINDOW_MS = 5 * 60 * 1000; // 5-minute sliding window
+const RATE_MAX_PER_WINDOW = 3;
+const sessionInvocations = new Map<string, number[]>();
+
+function isRateLimited(sessionKey: string): boolean {
+  const now = Date.now();
+  const timestamps = sessionInvocations.get(sessionKey) || [];
+
+  // Prune entries older than the window
+  const recent = timestamps.filter((t) => now - t < RATE_WINDOW_MS);
+  sessionInvocations.set(sessionKey, recent);
+
+  return recent.length >= RATE_MAX_PER_WINDOW;
+}
+
+function recordInvocation(sessionKey: string): void {
+  const timestamps = sessionInvocations.get(sessionKey) || [];
+  timestamps.push(Date.now());
+  sessionInvocations.set(sessionKey, timestamps);
+}
+
+// --- Deferred retry queue for capacity errors ---
+
+interface DeferredEmail {
+  email: {
+    id: string;
+    threadId: string;
+    subject: string;
+    body: string;
+    from: string;
+    to: string;
+    messageId: string;
+    attachments: AttachmentInfo[];
+  };
+  deferredAt: number;
+  attempts: number;
+}
+
+const deferredEmails = new Map<string, DeferredEmail>();
+const DEFER_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes between retries
+const MAX_DEFER_ATTEMPTS = 3;
+
+function isCapacityError(message: string): boolean {
+  return /too many concurrent/i.test(message) || /api timeout/i.test(message);
+}
+
+// --- Network resilience with exponential backoff ---
+
+let consecutiveErrors = 0;
+let errorStartTime = 0;
+const MAX_BACKOFF_MS = 5 * 60 * 1000; // Cap at 5 minutes
+
+function getBackoffMs(): number {
+  if (consecutiveErrors === 0) return POLL_INTERVAL_MS;
+  // Exponential backoff: base interval * 2^(errors-1), capped
+  const backoff = POLL_INTERVAL_MS * Math.pow(2, consecutiveErrors - 1);
+  return Math.min(backoff, MAX_BACKOFF_MS);
+}
+
+// --- Heartbeat ---
+
+let pollCount = 0;
+const HEARTBEAT_INTERVAL = 10; // Log every N polls
+
 // --- Per-subject session management ---
 
 interface SessionState {
@@ -119,6 +185,26 @@ function incrementMessage(sKey: string): void {
 
 const activeSessions = new Set<string>();
 
+// --- Graceful shutdown ---
+
+let shuttingDown = false;
+
+function handleShutdown(signal: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n${signal} received — shutting down gracefully...`);
+  console.log(`  Deferred emails: ${deferredEmails.size}`);
+  console.log(`  Active sessions: ${activeSessions.size}`);
+  process.exit(0);
+}
+
+process.on("SIGINT", () => handleShutdown("SIGINT"));
+process.on("SIGTERM", () => handleShutdown("SIGTERM"));
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason);
+  // Don't exit — log and continue
+});
+
 // --- Email processing ---
 
 async function processEmail(email: {
@@ -134,7 +220,6 @@ async function processEmail(email: {
   // Security: verify sender
   if (!isAllowedSender(email.from, ALLOWED_SENDER)) {
     console.log(`  REJECTED: email from ${email.from} (not ${ALLOWED_SENDER})`);
-    markAsProcessed(email.id);
     return;
   }
 
@@ -145,12 +230,24 @@ async function processEmail(email: {
 
   if (!prompt.trim()) {
     console.log("  Empty prompt — skipping");
-    markAsProcessed(email.id);
     return;
   }
 
   // Derive session key from subject line
   const sKey = subjectToKey(email.subject, TRIGGER_ADDRESS ? undefined : KEYWORD);
+
+  // Rate limiting check
+  if (isRateLimited(sKey)) {
+    console.log(`  Rate limited: "${sKey}" (${RATE_MAX_PER_WINDOW} invocations in ${RATE_WINDOW_MS / 1000}s window)`);
+    await replyToThread(
+      email.threadId,
+      email.messageId,
+      email.subject,
+      "Rate limit reached for this session. Please wait a few minutes before sending another message.",
+      ALLOWED_SENDER
+    );
+    return;
+  }
 
   // Build attachment context for Claude
   let fullPrompt = prompt;
@@ -182,12 +279,40 @@ async function processEmail(email: {
     console.log(`  New session (forced): ${session.sessionId}`);
   }
 
-  const session = getOrCreateSession(sKey, email.subject);
+  let session = getOrCreateSession(sKey, email.subject);
   const isFirst = !activeSessions.has(session.sessionId);
 
   console.log(`  Session: ${session.sessionId.slice(0, 8)}... (${isFirst ? "new" : "resume"}, ${session.messageCount} msgs)`);
 
-  const result = await runClaude(session.sessionId, fullPrompt, isFirst);
+  // Record the invocation for rate limiting
+  recordInvocation(sKey);
+
+  let result = await runClaude(session.sessionId, fullPrompt, isFirst);
+
+  // Handle dead session: create a new session and retry once
+  if (result.deadSession) {
+    console.log(`  Dead session detected — creating new session and retrying`);
+    session = newSession(sKey, email.subject);
+    activeSessions.delete(session.sessionId);
+    result = await runClaude(session.sessionId, fullPrompt, true);
+  }
+
+  // Handle capacity errors: defer for retry instead of sending error reply
+  if (result.isError && isCapacityError(result.result)) {
+    const existing = deferredEmails.get(email.id);
+    const attempts = existing ? existing.attempts + 1 : 1;
+
+    if (attempts <= MAX_DEFER_ATTEMPTS) {
+      console.log(`  Capacity error — deferring (attempt ${attempts}/${MAX_DEFER_ATTEMPTS})`);
+      deferredEmails.set(email.id, {
+        email,
+        deferredAt: Date.now(),
+        attempts,
+      });
+      return; // Don't reply with error — will retry later
+    }
+    console.log(`  Capacity error — max defer attempts reached, sending error reply`);
+  }
 
   if (!result.isError) {
     activeSessions.add(session.sessionId);
@@ -208,8 +333,6 @@ async function processEmail(email: {
     responseText += `\n\nPermission needed for:\n${denials.join("\n")}\nReply to this email with "yes" to approve.`;
   }
 
-  // Mark as processed BEFORE replying (so the reply doesn't trigger re-processing)
-  markAsProcessed(email.id);
   await markAsRead(email.id);
 
   // Reply in the same thread — ONLY to the allowed sender
@@ -224,29 +347,99 @@ async function processEmail(email: {
   console.log(`  Replied (${(result.durationMs / 1000).toFixed(1)}s, ${result.toolCalls.length} tools)`);
 }
 
+// --- Hard timeout wrapper for Gmail poll ---
+
+const POLL_TIMEOUT_MS = 45_000; // 45 seconds
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms / 1000}s`));
+    }, ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
+// --- Poll cycle ---
+
 async function poll(): Promise<void> {
+  if (shuttingDown) return;
+
+  pollCount++;
+
+  // Heartbeat logging
+  if (pollCount % HEARTBEAT_INTERVAL === 0) {
+    const deferred = deferredEmails.size;
+    const sessions = activeSessions.size;
+    console.log(`[${new Date().toLocaleTimeString("en-GB")}] Heartbeat: poll #${pollCount}, ${sessions} active sessions, ${deferred} deferred emails`);
+  }
+
   try {
-    const emails = await pollForEmails({
-      triggerAddress: TRIGGER_ADDRESS,
-      keyword: KEYWORD,
-      allowedSender: ALLOWED_SENDER,
-    });
+    const emails = await withTimeout(
+      pollForEmails({
+        triggerAddress: TRIGGER_ADDRESS,
+        keyword: KEYWORD,
+        allowedSender: ALLOWED_SENDER,
+      }),
+      POLL_TIMEOUT_MS,
+      "Gmail poll"
+    );
+
+    // Recovery: clear error state on success
+    if (consecutiveErrors > 0) {
+      const downtime = ((Date.now() - errorStartTime) / 1000).toFixed(0);
+      console.log(`[${new Date().toLocaleTimeString("en-GB")}] Recovered after ${consecutiveErrors} consecutive errors (${downtime}s downtime)`);
+      consecutiveErrors = 0;
+      errorStartTime = 0;
+    }
 
     if (emails.length > 0) {
       console.log(`\n[${new Date().toLocaleTimeString("en-GB")}] Found ${emails.length} email(s)`);
 
       // Process oldest first (Gmail returns newest first)
       for (const email of emails.reverse()) {
+        // Mark as processed BEFORE queueing to prevent race condition
+        // where a second poll picks up the same email
+        markAsProcessed(email.id);
+
         await enqueue("email", async () => {
           await processEmail(email);
         });
       }
     }
+
+    // Process one deferred email per cycle if cooldown has passed
+    for (const [emailId, deferred] of deferredEmails) {
+      if (Date.now() - deferred.deferredAt >= DEFER_COOLDOWN_MS) {
+        console.log(`[${new Date().toLocaleTimeString("en-GB")}] Retrying deferred email: ${deferred.email.subject} (attempt ${deferred.attempts + 1})`);
+        deferredEmails.delete(emailId);
+        await enqueue("email", async () => {
+          await processEmail(deferred.email);
+        });
+        break; // Only one per cycle
+      }
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (!message.includes("No messages matched")) {
-      console.error(`Poll error: ${message}`);
+      if (consecutiveErrors === 0) {
+        errorStartTime = Date.now();
+      }
+      consecutiveErrors++;
+      console.error(`Poll error (${consecutiveErrors} consecutive): ${message}`);
     }
+  }
+
+  // Schedule next poll with backoff
+  if (!shuttingDown) {
+    const nextInterval = getBackoffMs();
+    if (nextInterval !== POLL_INTERVAL_MS) {
+      console.log(`  Next poll in ${(nextInterval / 1000).toFixed(0)}s (backoff)`);
+    }
+    setTimeout(poll, nextInterval);
   }
 }
 
@@ -279,27 +472,14 @@ async function main(): Promise<void> {
   console.log(`Allowed sender: ${ALLOWED_SENDER}`);
   console.log(`Trigger: ${triggerMode}`);
   console.log(`Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
+  console.log(`Rate limit: ${RATE_MAX_PER_WINDOW} per ${RATE_WINDOW_MS / 60000}min per session`);
   console.log();
 
+  // Use self-scheduling setTimeout instead of setInterval (allows variable intervals)
   await poll();
-  setInterval(poll, POLL_INTERVAL_MS);
 }
 
 main().catch((err) => {
   console.error("Fatal error:", err);
   process.exit(1);
-});
-
-process.on("SIGINT", () => {
-  console.log("\nShutting down...");
-  process.exit(0);
-});
-
-process.on("SIGTERM", () => {
-  console.log("SIGTERM received — shutting down...");
-  process.exit(0);
-});
-
-process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled rejection:", reason);
 });

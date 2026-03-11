@@ -114,6 +114,25 @@ export function markAsProcessed(messageId: string): void {
 
 const ATTACHMENT_DIR = process.env.GMAIL_ATTACHMENT_DIR || "/tmp/email-bridge-attachments";
 
+// Body truncation limit — prevents extremely long forwarded threads
+// from overwhelming Claude's context
+const MAX_BODY_CHARS = 30_000;
+
+/**
+ * Recursively flatten all parts from a MIME message structure.
+ * Handles arbitrarily nested multipart containers (multipart/mixed > multipart/alternative, etc.)
+ */
+function flattenParts(parts: gmail_v1.Schema$MessagePart[]): gmail_v1.Schema$MessagePart[] {
+  const result: gmail_v1.Schema$MessagePart[] = [];
+  for (const part of parts) {
+    result.push(part);
+    if (part.parts) {
+      result.push(...flattenParts(part.parts));
+    }
+  }
+  return result;
+}
+
 /**
  * Download all attachments from a Gmail message to disk.
  * Returns metadata for each attachment including the local file path.
@@ -130,16 +149,8 @@ async function downloadAttachments(
   const attachments: AttachmentInfo[] = [];
   const msgDir = path.join(ATTACHMENT_DIR, gmailMessageId);
 
-  // Flatten nested parts (multipart/mixed > multipart/alternative + attachments)
-  const allParts: gmail_v1.Schema$MessagePart[] = [];
-  for (const part of parts) {
-    allParts.push(part);
-    if (part.parts) {
-      for (const nested of part.parts) {
-        allParts.push(nested);
-      }
-    }
-  }
+  // Recursively flatten all nested parts
+  const allParts = flattenParts(parts);
 
   const attachmentParts = allParts.filter(
     (p) => p.filename && p.filename.length > 0 && p.body
@@ -191,6 +202,35 @@ async function downloadAttachments(
 }
 
 /**
+ * Convert plain text to basic HTML for email replies.
+ * Escapes HTML entities and wraps paragraphs in <p> tags.
+ */
+function plainToHtml(text: string): string {
+  const escaped = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+  // Split on double newlines for paragraphs
+  const paragraphs = escaped.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  return paragraphs.map((p) => `<p>${p.replace(/\n/g, "<br>")}</p>`).join("\n");
+}
+
+/**
+ * Encode a subject line per RFC 2047 if it contains non-ASCII characters.
+ * Uses UTF-8 Base64 encoding: =?UTF-8?B?...?=
+ */
+function encodeSubject(subject: string): string {
+  // Check if subject contains non-ASCII characters
+  if (/^[\x20-\x7E]*$/.test(subject)) {
+    return subject; // Pure ASCII — no encoding needed
+  }
+  const encoded = Buffer.from(subject, "utf-8").toString("base64");
+  return `=?UTF-8?B?${encoded}?=`;
+}
+
+/**
  * Poll for recent emails using either plus-address or keyword trigger.
  *
  * Plus-address mode (GMAIL_TRIGGER_ADDRESS set):
@@ -222,7 +262,12 @@ export async function pollForEmails(config: {
   });
 
   const messageIds = res.data.messages || [];
-  if (messageIds.length === 0) return [];
+  if (messageIds.length === 0) {
+    console.log(`  [poll] 0 messages matched query: ${query}`);
+    return [];
+  }
+
+  console.log(`  [poll] ${messageIds.length} message(s) matched, checking processed IDs...`);
 
   const emails: EmailMessage[] = [];
   const keywordPattern = new RegExp(`^${config.keyword}\\s*(NEW\\s*)?:`, "i");
@@ -283,26 +328,21 @@ export async function pollForEmails(config: {
       body = Buffer.from(payload.body.data, "base64url").toString("utf-8");
     } else if (payload?.parts) {
       // Multipart — find text/plain first, then text/html
-      const textPart = payload.parts.find((p) => p.mimeType === "text/plain");
-      const htmlPart = payload.parts.find((p) => p.mimeType === "text/html");
-      // Also check nested parts (multipart/alternative inside multipart/mixed)
-      const nestedTextPart = !textPart ? payload.parts
-        .filter((p) => p.parts)
-        .flatMap((p) => p.parts || [])
-        .find((p) => p.mimeType === "text/plain") : null;
-      const part = textPart || nestedTextPart || htmlPart;
+      // Flatten all nested parts to handle multipart/alternative inside multipart/mixed
+      const allParts = flattenParts(payload.parts);
+      const textPart = allParts.find((p) => p.mimeType === "text/plain" && p.body?.data);
+      const htmlPart = allParts.find((p) => p.mimeType === "text/html" && p.body?.data);
+      const part = textPart || htmlPart;
       if (part?.body?.data) {
         body = Buffer.from(part.body.data, "base64url").toString("utf-8");
-        if (!textPart && !nestedTextPart && htmlPart) {
+        if (!textPart && htmlPart) {
           // Strip HTML tags for a rough plain text version
           body = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
         }
       }
     }
 
-    // Cap body at 30KB to prevent extremely long forwarded threads
-    // from overwhelming Claude's context
-    const MAX_BODY_CHARS = 30_000;
+    // Truncate body to prevent overwhelming Claude's context
     if (body.length > MAX_BODY_CHARS) {
       body = body.slice(0, MAX_BODY_CHARS) + "\n\n[... truncated — original was " +
         Math.round(body.length / 1000) + "KB]";
@@ -330,6 +370,7 @@ export async function pollForEmails(config: {
     });
   }
 
+  console.log(`  [poll] ${emails.length} new email(s) to process`);
   return emails;
 }
 
@@ -352,6 +393,10 @@ export async function markAsRead(messageId: string): Promise<void> {
  *
  * PRIVACY: This function deliberately ignores any CC/BCC from the original
  * email and always sends to the provided reply address only.
+ * Validates that the reply address matches the configured allowed sender.
+ *
+ * Sends as multipart/alternative (plain text + HTML) for better rendering
+ * across email clients.
  */
 export async function replyToThread(
   threadId: string,
@@ -362,20 +407,45 @@ export async function replyToThread(
 ): Promise<void> {
   const gmail = getGmail();
 
-  // Ensure subject has Re: prefix
-  const reSubject = subject.startsWith("Re:") ? subject : `Re: ${subject}`;
+  // Validate reply address against allowed sender (defence in depth)
+  const allowedSender = process.env.GMAIL_ALLOWED_SENDER || "";
+  if (allowedSender && replyToAddress.toLowerCase() !== allowedSender.toLowerCase()) {
+    console.error(`  SECURITY: Reply address "${replyToAddress}" does not match allowed sender "${allowedSender}" — blocking reply`);
+    return;
+  }
 
-  // Build RFC 2822 email — reply ONLY to the specified address
+  // Ensure subject has Re: prefix, encode if non-ASCII
+  const reSubject = subject.startsWith("Re:") ? subject : `Re: ${subject}`;
+  const encodedSubject = encodeSubject(reSubject);
+
+  // Build HTML version of the response
+  const htmlBody = plainToHtml(responseBody);
+
+  // MIME boundary for multipart/alternative
+  const boundary = `boundary_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+  // Build RFC 2822 multipart email — reply ONLY to the specified address
   const rawEmail = [
     `To: ${replyToAddress}`,
-    `Subject: ${reSubject}`,
+    `Subject: ${encodedSubject}`,
     `In-Reply-To: ${inReplyToMessageId}`,
     `References: ${inReplyToMessageId}`,
     `MIME-Version: 1.0`,
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    ``,
+    `--${boundary}`,
     `Content-Type: text/plain; charset="UTF-8"`,
     `Content-Transfer-Encoding: 7bit`,
     ``,
     responseBody,
+    ``,
+    `--${boundary}`,
+    `Content-Type: text/html; charset="UTF-8"`,
+    `Content-Transfer-Encoding: 7bit`,
+    ``,
+    htmlBody,
+    ``,
+    `--${boundary}--`,
   ].join("\r\n");
 
   // Base64url encode

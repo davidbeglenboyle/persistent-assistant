@@ -1,4 +1,4 @@
-import { Bot, Context } from "grammy";
+import { Bot, Context, InputFile } from "grammy";
 import { runClaude, PermissionDenial, ProgressCallback, summarizeToolInput } from "./claude";
 import { enqueue, queueLength } from "./queue";
 import {
@@ -11,6 +11,90 @@ import {
 import { logExchange } from "./logger";
 import { downloadTelegramFile, cleanupOldImages } from "./download";
 import { isAlreadyProcessed, markProcessed } from "./dedup";
+import * as fs from "fs";
+import * as path from "path";
+
+// --- Media marker support ---
+// Claude can embed SEND_IMAGE:/path, SEND_DOCUMENT:/path etc. in responses
+// to send files back to the user via Telegram.
+
+interface MediaItem {
+  type: "photo" | "document" | "audio" | "video";
+  filePath: string;
+  caption?: string;
+}
+
+const MEDIA_MARKER_RE = /^SEND_(IMAGE|DOCUMENT|AUDIO|VIDEO):(.+)$/gm;
+
+function parseMediaMarkers(text: string): { cleanText: string; mediaItems: MediaItem[] } {
+  const mediaItems: MediaItem[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = MEDIA_MARKER_RE.exec(text)) !== null) {
+    const typeMap: Record<string, MediaItem["type"]> = {
+      IMAGE: "photo",
+      DOCUMENT: "document",
+      AUDIO: "audio",
+      VIDEO: "video",
+    };
+    mediaItems.push({
+      type: typeMap[match[1]] || "document",
+      filePath: match[2].trim(),
+    });
+  }
+
+  // Remove marker lines from the text
+  const cleanText = text.replace(MEDIA_MARKER_RE, "").replace(/\n{3,}/g, "\n\n").trim();
+  return { cleanText, mediaItems };
+}
+
+const PHOTO_SIZE_LIMIT = 10 * 1024 * 1024; // 10 MB
+const OTHER_SIZE_LIMIT = 50 * 1024 * 1024; // 50 MB
+
+async function sendMediaItem(
+  ctx: Context,
+  item: MediaItem,
+  mode: "dm" | "group"
+): Promise<string | null> {
+  if (!fs.existsSync(item.filePath)) {
+    return `File not found: ${item.filePath}`;
+  }
+
+  const stats = fs.statSync(item.filePath);
+  const sizeLimit = item.type === "photo" ? PHOTO_SIZE_LIMIT : OTHER_SIZE_LIMIT;
+  if (stats.size > sizeLimit) {
+    const limitMB = sizeLimit / (1024 * 1024);
+    return `File too large (${(stats.size / (1024 * 1024)).toFixed(1)} MB, limit ${limitMB} MB): ${item.filePath}`;
+  }
+
+  const threadId = ctx.message?.message_thread_id;
+  const threadOpts = mode === "group" && threadId ? { message_thread_id: threadId } : {};
+  const inputFile = new InputFile(item.filePath);
+  const filename = path.basename(item.filePath);
+
+  try {
+    switch (item.type) {
+      case "photo":
+        await ctx.replyWithPhoto(inputFile, { caption: item.caption, ...threadOpts });
+        break;
+      case "document":
+        await ctx.replyWithDocument(inputFile, { caption: item.caption, ...threadOpts });
+        break;
+      case "audio":
+        await ctx.replyWithAudio(inputFile, { caption: item.caption, ...threadOpts });
+        break;
+      case "video":
+        await ctx.replyWithVideo(inputFile, { caption: item.caption, ...threadOpts });
+        break;
+    }
+    console.log(`  Sent ${item.type}: ${filename}`);
+    return null;
+  } catch (err) {
+    return `Failed to send ${item.type} ${filename}: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+// --- End media marker support ---
 
 const APPROVAL_PATTERN = /^(yes|yeah|y|allow|go ahead|approved|do it|ok)$/i;
 
@@ -99,6 +183,27 @@ export function createBot(
     return chatId !== undefined && allowedChatIds.includes(chatId);
   }
 
+  // Redirect messages sent to the General topic in forum groups
+  function redirectIfGeneral(ctx: Context): boolean {
+    const topicId = getTopicId(ctx);
+    if (topicId !== "general-topic") return false;
+
+    const sessions = getAllSessions();
+    const topicLines = sessions
+      .filter(({ topicId: tid }) => tid !== "general" && tid !== "general-topic")
+      .map(({ topicId: tid, state }) => {
+        const name = state.topicName ? ` (${state.topicName})` : "";
+        return `• Topic ${tid}${name}`;
+      });
+
+    const hint = topicLines.length > 0
+      ? `Active topics:\n${topicLines.join("\n")}\n\nPlease resend your message in the appropriate topic.`
+      : "No active topics yet. Create a topic in this group and send your message there.";
+
+    reply(ctx, `Messages to the General topic are not processed.\n\n${hint}`).catch(() => {});
+    return true;
+  }
+
   // Reply helper: sends to the correct topic thread
   async function reply(ctx: Context, text: string): Promise<void> {
     const threadId = ctx.message?.message_thread_id;
@@ -159,7 +264,7 @@ export function createBot(
     const typingInterval = setInterval(() => sendTyping(ctx), 4000);
 
     try {
-      const result = await enqueue(topicId, async () => {
+      let result = await enqueue(topicId, async () => {
         const session = getOrCreateSession(topicId);
         const isFirst = !activeSessions.has(session.sessionId);
 
@@ -189,6 +294,44 @@ export function createBot(
         return claudeResult;
       });
 
+      // Handle dead sessions: start fresh and retry once
+      if (result.deadSession) {
+        console.log(`  [${topicLabel}] Dead session detected, starting fresh session...`);
+        const oldSession = getOrCreateSession(topicId);
+        activeSessions.delete(oldSession.sessionId);
+        const freshSession = newSession(topicId);
+
+        result = await enqueue(topicId, async () => {
+          console.log(
+            `  [${topicLabel}] Retrying with fresh session ${freshSession.sessionId.slice(0, 8)}...`
+          );
+
+          const onProgress: ProgressCallback = ({ elapsedMin, toolCallCount }) => {
+            const toolNote = toolCallCount > 0 ? ` (${toolCallCount} tool calls so far)` : "";
+            reply(ctx, `Still working... ${elapsedMin} min elapsed${toolNote}`).catch(() => {});
+          };
+
+          const claudeResult = await runClaude(
+            freshSession.sessionId,
+            finalMessage,
+            true, // isFirst — brand new session
+            extraTools,
+            onProgress
+          );
+
+          if (!claudeResult.isError) {
+            activeSessions.add(freshSession.sessionId);
+            incrementMessage(topicId);
+          }
+
+          return claudeResult;
+        });
+
+        if (!result.deadSession) {
+          console.log(`  [${topicLabel}] Recovery succeeded with fresh session`);
+        }
+      }
+
       clearInterval(typingInterval);
 
       // Log the exchange (including tool calls for audit trail)
@@ -216,8 +359,29 @@ export function createBot(
         console.log(`  [${topicLabel}] Permission denials: ${deniedToolNames.join(", ")}`);
       }
 
-      // Send response to the correct topic
-      await reply(ctx, responseText);
+      // Parse media markers from Claude's response
+      const { cleanText, mediaItems } = parseMediaMarkers(responseText);
+
+      if (mediaItems.length > 0) {
+        // Send each media item, collecting any errors
+        const errors: string[] = [];
+        for (const item of mediaItems) {
+          const err = await sendMediaItem(ctx, item, mode);
+          if (err) errors.push(err);
+        }
+
+        // Build final text: clean response + any media errors
+        let finalText = cleanText;
+        if (errors.length > 0) {
+          finalText += `\n\n⚠️ Media errors:\n${errors.map((e) => `• ${e}`).join("\n")}`;
+        }
+        if (finalText.trim()) {
+          await reply(ctx, finalText);
+        }
+      } else {
+        // No media markers — send text as before
+        await reply(ctx, responseText);
+      }
 
       console.log(`  [${topicLabel}] Done in ${(result.durationMs / 1000).toFixed(1)}s`);
     } catch (err) {
@@ -277,18 +441,20 @@ export function createBot(
     await reply(ctx, lines.join("\n"));
   });
 
+  // --- Photo handler ---
   bot.on("message:photo", async (ctx: Context) => {
     if (!isAllowed(ctx)) {
       console.log(`Rejected photo from chat ${ctx.chat?.id}`);
       return;
     }
 
-    // Skip already-processed updates (prevents restart replay loops)
     const updateId = ctx.update.update_id;
     if (isAlreadyProcessed(updateId)) {
       console.log(`Skipping already-processed photo update ${updateId}`);
       return;
     }
+
+    if (redirectIfGeneral(ctx)) return;
 
     const photos = ctx.message?.photo;
     if (!photos || photos.length === 0) return;
@@ -305,7 +471,6 @@ export function createBot(
       const downloaded = await downloadTelegramFile(token, bestPhoto.file_id);
       console.log(`  Downloaded: ${downloaded.localPath} (${(downloaded.sizeBytes / 1024).toFixed(0)} KB)`);
 
-      // Build the message for Claude
       const parts: string[] = [
         `I've sent you a photo. It's saved at ${downloaded.localPath} — use the Read tool to view it.`,
       ];
@@ -315,10 +480,10 @@ export function createBot(
       const claudeMessage = parts.join("");
       const logLabel = caption ? `[Photo] ${caption}` : "[Photo]";
 
-      markProcessed(updateId); // Acknowledge before processing — prevents replay on crash
+      markProcessed(updateId);
       await processAndRespond(ctx, claudeMessage, logLabel);
     } catch (err) {
-      markProcessed(updateId); // Also mark on download error — don't retry broken downloads
+      markProcessed(updateId);
       console.error(`  [${topicLabel}] Photo download error:`, err);
       try {
         await reply(ctx, `Failed to process photo: ${err instanceof Error ? err.message : String(err)}`);
@@ -328,6 +493,243 @@ export function createBot(
     }
   });
 
+  // --- Document handler ---
+  bot.on("message:document", async (ctx: Context) => {
+    if (!isAllowed(ctx)) {
+      console.log(`Rejected document from chat ${ctx.chat?.id}`);
+      return;
+    }
+
+    const updateId = ctx.update.update_id;
+    if (isAlreadyProcessed(updateId)) {
+      console.log(`Skipping already-processed document update ${updateId}`);
+      return;
+    }
+
+    if (redirectIfGeneral(ctx)) return;
+
+    const doc = ctx.message?.document;
+    if (!doc) return;
+
+    const topicId = getTopicId(ctx);
+    const topicLabel = getTopicLabel(topicId);
+    const caption = ctx.message?.caption || "";
+    const fileName = doc.file_name || "unknown";
+    console.log(`\n[${topicLabel}] Document received: ${fileName}${caption ? ` — ${caption.slice(0, 80)}...` : ""}`);
+
+    try {
+      const downloaded = await downloadTelegramFile(token, doc.file_id);
+      console.log(`  Downloaded: ${downloaded.localPath} (${(downloaded.sizeBytes / 1024).toFixed(0)} KB)`);
+
+      const parts: string[] = [
+        `I've sent you a document. It's saved at ${downloaded.localPath} (filename: ${fileName}).`,
+      ];
+      if (caption) {
+        parts.push(`\nCaption: ${caption}`);
+      }
+      const claudeMessage = parts.join("");
+      const logLabel = caption ? `[Document: ${fileName}] ${caption}` : `[Document: ${fileName}]`;
+
+      markProcessed(updateId);
+      await processAndRespond(ctx, claudeMessage, logLabel);
+    } catch (err) {
+      markProcessed(updateId);
+      console.error(`  [${topicLabel}] Document download error:`, err);
+      try {
+        await reply(ctx, `Failed to process document: ${err instanceof Error ? err.message : String(err)}`);
+      } catch (replyErr) {
+        console.error(`  [${topicLabel}] Failed to send error reply:`, replyErr);
+      }
+    }
+  });
+
+  // --- Audio handler ---
+  bot.on("message:audio", async (ctx: Context) => {
+    if (!isAllowed(ctx)) {
+      console.log(`Rejected audio from chat ${ctx.chat?.id}`);
+      return;
+    }
+
+    const updateId = ctx.update.update_id;
+    if (isAlreadyProcessed(updateId)) {
+      console.log(`Skipping already-processed audio update ${updateId}`);
+      return;
+    }
+
+    if (redirectIfGeneral(ctx)) return;
+
+    const audio = ctx.message?.audio;
+    if (!audio) return;
+
+    const topicId = getTopicId(ctx);
+    const topicLabel = getTopicLabel(topicId);
+    const caption = ctx.message?.caption || "";
+    const fileName = audio.file_name || "audio";
+    console.log(`\n[${topicLabel}] Audio received: ${fileName}`);
+
+    try {
+      const downloaded = await downloadTelegramFile(token, audio.file_id);
+      console.log(`  Downloaded: ${downloaded.localPath} (${(downloaded.sizeBytes / 1024).toFixed(0)} KB)`);
+
+      const parts: string[] = [
+        `I've sent you an audio file. It's saved at ${downloaded.localPath} (filename: ${fileName}).`,
+      ];
+      if (caption) {
+        parts.push(`\nCaption: ${caption}`);
+      }
+      const claudeMessage = parts.join("");
+      const logLabel = caption ? `[Audio: ${fileName}] ${caption}` : `[Audio: ${fileName}]`;
+
+      markProcessed(updateId);
+      await processAndRespond(ctx, claudeMessage, logLabel);
+    } catch (err) {
+      markProcessed(updateId);
+      console.error(`  [${topicLabel}] Audio download error:`, err);
+      try {
+        await reply(ctx, `Failed to process audio: ${err instanceof Error ? err.message : String(err)}`);
+      } catch (replyErr) {
+        console.error(`  [${topicLabel}] Failed to send error reply:`, replyErr);
+      }
+    }
+  });
+
+  // --- Voice message handler ---
+  bot.on("message:voice", async (ctx: Context) => {
+    if (!isAllowed(ctx)) {
+      console.log(`Rejected voice message from chat ${ctx.chat?.id}`);
+      return;
+    }
+
+    const updateId = ctx.update.update_id;
+    if (isAlreadyProcessed(updateId)) {
+      console.log(`Skipping already-processed voice update ${updateId}`);
+      return;
+    }
+
+    if (redirectIfGeneral(ctx)) return;
+
+    const voice = ctx.message?.voice;
+    if (!voice) return;
+
+    const topicId = getTopicId(ctx);
+    const topicLabel = getTopicLabel(topicId);
+    const fileName = `voice-${Date.now()}.ogg`;
+    console.log(`\n[${topicLabel}] Voice message received (${voice.duration}s)`);
+
+    try {
+      const downloaded = await downloadTelegramFile(token, voice.file_id);
+      console.log(`  Downloaded: ${downloaded.localPath} (${(downloaded.sizeBytes / 1024).toFixed(0)} KB)`);
+
+      const claudeMessage = `I've sent you a voice message (${voice.duration}s). It's saved at ${downloaded.localPath} (filename: ${fileName}).`;
+      const logLabel = `[Voice: ${voice.duration}s]`;
+
+      markProcessed(updateId);
+      await processAndRespond(ctx, claudeMessage, logLabel);
+    } catch (err) {
+      markProcessed(updateId);
+      console.error(`  [${topicLabel}] Voice download error:`, err);
+      try {
+        await reply(ctx, `Failed to process voice message: ${err instanceof Error ? err.message : String(err)}`);
+      } catch (replyErr) {
+        console.error(`  [${topicLabel}] Failed to send error reply:`, replyErr);
+      }
+    }
+  });
+
+  // --- Video handler ---
+  bot.on("message:video", async (ctx: Context) => {
+    if (!isAllowed(ctx)) {
+      console.log(`Rejected video from chat ${ctx.chat?.id}`);
+      return;
+    }
+
+    const updateId = ctx.update.update_id;
+    if (isAlreadyProcessed(updateId)) {
+      console.log(`Skipping already-processed video update ${updateId}`);
+      return;
+    }
+
+    if (redirectIfGeneral(ctx)) return;
+
+    const video = ctx.message?.video;
+    if (!video) return;
+
+    const topicId = getTopicId(ctx);
+    const topicLabel = getTopicLabel(topicId);
+    const caption = ctx.message?.caption || "";
+    const fileName = video.file_name || "video";
+    console.log(`\n[${topicLabel}] Video received: ${fileName}`);
+
+    try {
+      const downloaded = await downloadTelegramFile(token, video.file_id);
+      console.log(`  Downloaded: ${downloaded.localPath} (${(downloaded.sizeBytes / 1024).toFixed(0)} KB)`);
+
+      const parts: string[] = [
+        `I've sent you a video. It's saved at ${downloaded.localPath} (filename: ${fileName}).`,
+      ];
+      if (caption) {
+        parts.push(`\nCaption: ${caption}`);
+      }
+      const claudeMessage = parts.join("");
+      const logLabel = caption ? `[Video: ${fileName}] ${caption}` : `[Video: ${fileName}]`;
+
+      markProcessed(updateId);
+      await processAndRespond(ctx, claudeMessage, logLabel);
+    } catch (err) {
+      markProcessed(updateId);
+      console.error(`  [${topicLabel}] Video download error:`, err);
+      try {
+        await reply(ctx, `Failed to process video: ${err instanceof Error ? err.message : String(err)}`);
+      } catch (replyErr) {
+        console.error(`  [${topicLabel}] Failed to send error reply:`, replyErr);
+      }
+    }
+  });
+
+  // --- Video note (round video) handler ---
+  bot.on("message:video_note", async (ctx: Context) => {
+    if (!isAllowed(ctx)) {
+      console.log(`Rejected video note from chat ${ctx.chat?.id}`);
+      return;
+    }
+
+    const updateId = ctx.update.update_id;
+    if (isAlreadyProcessed(updateId)) {
+      console.log(`Skipping already-processed video_note update ${updateId}`);
+      return;
+    }
+
+    if (redirectIfGeneral(ctx)) return;
+
+    const videoNote = ctx.message?.video_note;
+    if (!videoNote) return;
+
+    const topicId = getTopicId(ctx);
+    const topicLabel = getTopicLabel(topicId);
+    const fileName = `video-note-${Date.now()}.mp4`;
+    console.log(`\n[${topicLabel}] Video note received (${videoNote.duration}s)`);
+
+    try {
+      const downloaded = await downloadTelegramFile(token, videoNote.file_id);
+      console.log(`  Downloaded: ${downloaded.localPath} (${(downloaded.sizeBytes / 1024).toFixed(0)} KB)`);
+
+      const claudeMessage = `I've sent you a round video message (${videoNote.duration}s). It's saved at ${downloaded.localPath} (filename: ${fileName}).`;
+      const logLabel = `[VideoNote: ${videoNote.duration}s]`;
+
+      markProcessed(updateId);
+      await processAndRespond(ctx, claudeMessage, logLabel);
+    } catch (err) {
+      markProcessed(updateId);
+      console.error(`  [${topicLabel}] Video note download error:`, err);
+      try {
+        await reply(ctx, `Failed to process video note: ${err instanceof Error ? err.message : String(err)}`);
+      } catch (replyErr) {
+        console.error(`  [${topicLabel}] Failed to send error reply:`, replyErr);
+      }
+    }
+  });
+
+  // --- Text message handler ---
   bot.on("message:text", async (ctx: Context) => {
     if (!isAllowed(ctx)) {
       console.log(`Rejected message from chat ${ctx.chat?.id}`);
@@ -343,6 +745,8 @@ export function createBot(
 
     const userMessage = ctx.message?.text;
     if (!userMessage) return;
+
+    if (redirectIfGeneral(ctx)) return;
 
     // In group mode, respond to all messages (private group — no @mention required)
     // In DM mode, respond to all messages (direct conversation)

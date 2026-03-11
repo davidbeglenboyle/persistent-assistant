@@ -1,5 +1,7 @@
 import { createBot } from "./bot";
 import { getAllSessions } from "./session";
+import { queueLength } from "./queue";
+import { execFileSync } from "child_process";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const chatIdEnv = process.env.TELEGRAM_CHAT_ID;
@@ -31,6 +33,18 @@ for (const { topicId, state } of sessions) {
 console.log(`Allowed chat IDs: ${allowedChatIds.join(", ")}`);
 console.log();
 
+// Health check: verify Claude CLI is reachable
+try {
+  const claudeBin = process.env.CLAUDE_PATH || "claude";
+  const version = execFileSync(claudeBin, ["--version"], {
+    timeout: 10_000,
+    encoding: "utf-8",
+  }).trim();
+  console.log(`Claude CLI: ${version}`);
+} catch {
+  console.warn("Warning: could not run 'claude --version'. Check CLAUDE_PATH or install Claude Code CLI.");
+}
+
 const bot = createBot(token, allowedChatIds, mode);
 
 // Catch middleware errors so grammy doesn't stop the bot and throw
@@ -38,17 +52,51 @@ bot.catch((err) => {
   console.error(`Error handling update ${err.ctx?.update?.update_id}:`, err.error);
 });
 
-// Delay startup to let any previous instance's Telegram connection time out (avoids 409 conflict)
-setTimeout(() => {
-  bot.start({
-    onStart: (botInfo) => {
-      console.log(`Bot @${botInfo.username} is running (${mode} mode). Send messages via Telegram.`);
-    },
-  }).catch((err) => {
-    console.error("Bot polling fatal error:", err);
-    process.exit(1); // Exit so launchd/systemd restarts
-  });
-}, 5000);
+// 409 retry constants — Telegram rejects polling if a previous connection lingers
+const MAX_409_RETRIES = 5;
+const RETRY_DELAY_MS = 35_000;
+const INITIAL_DELAY_MS = 35_000;
+
+const startTime = Date.now();
+
+async function startWithRetry(): Promise<void> {
+  // Initial delay to let any previous instance's Telegram connection expire
+  console.log(`Waiting ${INITIAL_DELAY_MS / 1000}s before starting polling...`);
+  await new Promise((r) => setTimeout(r, INITIAL_DELAY_MS));
+
+  // Drop any leftover webhook so long-polling works cleanly
+  await bot.api.deleteWebhook({ drop_pending_updates: false });
+
+  for (let attempt = 1; attempt <= MAX_409_RETRIES; attempt++) {
+    try {
+      await bot.start({
+        onStart: (botInfo) => {
+          console.log(`Bot @${botInfo.username} is running (${mode} mode). Send messages via Telegram.`);
+        },
+      });
+      return; // bot.start() resolved normally (e.g. bot.stop() called)
+    } catch (err: unknown) {
+      const is409 =
+        err instanceof Error && (err.message.includes("409") || err.message.includes("Conflict"));
+      if (is409 && attempt < MAX_409_RETRIES) {
+        console.warn(`409 Conflict on attempt ${attempt}/${MAX_409_RETRIES}. Retrying in ${RETRY_DELAY_MS / 1000}s...`);
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+      } else {
+        console.error("Bot polling fatal error:", err);
+        process.exit(1);
+      }
+    }
+  }
+}
+
+startWithRetry();
+
+// Heartbeat: log uptime and queue depth every 30 minutes
+setInterval(() => {
+  const uptimeMin = Math.round((Date.now() - startTime) / 60_000);
+  const depth = queueLength();
+  console.log(`[heartbeat] uptime=${uptimeMin}m queue=${depth}`);
+}, 30 * 60_000);
 
 // Safety net — log unhandled rejections but don't crash
 process.on("unhandledRejection", (reason) => {

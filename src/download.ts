@@ -15,7 +15,8 @@ interface TelegramFileResponse {
 
 export async function downloadTelegramFile(
   token: string,
-  fileId: string
+  fileId: string,
+  originalName?: string
 ): Promise<DownloadedFile> {
   // 1. Resolve file_path via Telegram getFile API
   const apiUrl = `https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`;
@@ -36,10 +37,22 @@ export async function downloadTelegramFile(
     fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
   }
 
-  // 3. Safe local filename: ISO timestamp + extension from remote path
-  const ext = path.extname(remotePath) || ".jpg";
+  // 3. Safe local filename
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const localPath = path.join(DOWNLOAD_DIR, `${timestamp}${ext}`);
+  let localFilename: string;
+
+  if (originalName) {
+    // Sanitize: remove path separators and limit length
+    const sanitized = originalName
+      .replace(/[/\\]/g, "_")
+      .slice(0, 200);
+    localFilename = `${timestamp}_${sanitized}`;
+  } else {
+    const ext = path.extname(remotePath) || ".jpg";
+    localFilename = `${timestamp}${ext}`;
+  }
+
+  const localPath = path.join(DOWNLOAD_DIR, localFilename);
 
   // 4. Download file content
   const fileUrl = `https://api.telegram.org/file/bot${token}/${remotePath}`;
