@@ -100,6 +100,32 @@ const APPROVAL_PATTERN = /^(yes|yeah|y|allow|go ahead|approved|do it|ok)$/i;
 
 const TELEGRAM_MAX_LENGTH = 4096;
 
+/**
+ * Build a three-tier progress message:
+ * 1. Cold start (no tool info yet): "Still working... 5 min elapsed (3 tool calls so far)"
+ * 2. Fresh tool activity: "Still working... 5 min elapsed — on Agent (search Gmail)"
+ * 3. Stuck warning (>= 3 min idle): "Still working... 10 min elapsed — stuck 4+ min on Bash (find ...) — will time out if stuck"
+ */
+function buildProgressMessage(info: {
+  elapsedMin: number;
+  toolCallCount: number;
+  lastTool?: { name: string; summary: string };
+  minSinceLastEvent?: number;
+}): string {
+  const { elapsedMin, toolCallCount, lastTool, minSinceLastEvent } = info;
+
+  if (minSinceLastEvent != null && minSinceLastEvent >= 3 && lastTool) {
+    return `Still working... ${elapsedMin} min elapsed — stuck ${minSinceLastEvent}+ min on ${lastTool.name} (${lastTool.summary}) — will time out if stuck`;
+  }
+
+  if (lastTool) {
+    return `Still working... ${elapsedMin} min elapsed — on ${lastTool.name} (${lastTool.summary})`;
+  }
+
+  const toolNote = toolCallCount > 0 ? ` (${toolCallCount} tool calls so far)` : "";
+  return `Still working... ${elapsedMin} min elapsed${toolNote}`;
+}
+
 function splitMessage(text: string): string[] {
   if (text.length <= TELEGRAM_MAX_LENGTH) return [text];
 
@@ -272,10 +298,9 @@ export function createBot(
           `  [${topicLabel}] Running claude (${isFirst ? "new" : "resume"} session ${session.sessionId.slice(0, 8)}...)`
         );
 
-        const onProgress: ProgressCallback = ({ elapsedMin, toolCallCount }) => {
-          const toolNote = toolCallCount > 0 ? ` (${toolCallCount} tool calls so far)` : "";
-          reply(ctx, `Still working... ${elapsedMin} min elapsed${toolNote}`).catch(() => {});
-          console.log(`  [${topicLabel}] Progress: ${elapsedMin}min, ${toolCallCount} tool calls`);
+        const onProgress: ProgressCallback = (info) => {
+          reply(ctx, buildProgressMessage(info)).catch(() => {});
+          console.log(`  [${topicLabel}] Progress: ${info.elapsedMin}min, ${info.toolCallCount} tool calls`);
         };
 
         const claudeResult = await runClaude(
@@ -306,9 +331,8 @@ export function createBot(
             `  [${topicLabel}] Retrying with fresh session ${freshSession.sessionId.slice(0, 8)}...`
           );
 
-          const onProgress: ProgressCallback = ({ elapsedMin, toolCallCount }) => {
-            const toolNote = toolCallCount > 0 ? ` (${toolCallCount} tool calls so far)` : "";
-            reply(ctx, `Still working... ${elapsedMin} min elapsed${toolNote}`).catch(() => {});
+          const onProgress: ProgressCallback = (info) => {
+            reply(ctx, buildProgressMessage(info)).catch(() => {});
           };
 
           const claudeResult = await runClaude(
@@ -336,6 +360,28 @@ export function createBot(
 
       // Log the exchange (including tool calls for audit trail)
       logExchange(logLabel, result.result, result.toolCalls, topicId);
+
+      // Handle stalled results: send partial output with /new keyboard button
+      if (result.stalled) {
+        const threadId = ctx.message?.message_thread_id;
+        const chunks = splitMessage(result.result);
+        for (let i = 0; i < chunks.length; i++) {
+          const isLast = i === chunks.length - 1;
+          const opts: Record<string, unknown> = {};
+          if (mode === "group" && threadId) opts.message_thread_id = threadId;
+          if (isLast) {
+            opts.reply_markup = {
+              keyboard: [[{ text: "/new" }]],
+              resize_keyboard: true,
+              one_time_keyboard: true,
+            };
+          }
+          await ctx.reply(chunks[i], opts);
+        }
+        console.log(`  [${topicLabel}] Done (stalled) in ${(result.durationMs / 1000).toFixed(1)}s`);
+        logExchange("(stalled)", result.result, result.toolCalls, topicId);
+        return;
+      }
 
       // Build response text
       let responseText = result.result;

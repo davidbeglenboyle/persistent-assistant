@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-04-17
+
+### Stalled-tool detection, process-group kill, smarter lock recovery, progress UX
+Ported from production: four reliability fixes and a progress-message UX improvement.
+
+**Stalled-progress detection** — New `NO_PROGRESS_TIMEOUT_MS = 10 min` sliding timer detects when a tool_use (Agent subagent or Bash command) hangs mid-stream without returning a tool_result. Previous no-output timeout only caught zero-byte hangs, not "output arrived but stream went quiet." Surfaces "Warning: Task stalled after 10 min waiting on: TOOL (summary)" to the user. No auto-retry (stalls are usually deterministic). New `stalled: boolean` field on `ClaudeResult`.
+
+**Process-group kill** — `spawn(..., { detached: true })` + `killProcessTree()` sends signals to `-pgid` so subagent children and Bash descendants die with the parent. Prevents session-lock cascade where orphan processes hold the JSONL lock after SIGKILL.
+
+**Smarter session-lock recovery** — `waitForSessionRelease()` polls for up to 30s instead of a blind 10s sleep. If still held, `killSessionOrphans()` cleans up. Falls back to a clear error message suggesting `/new`.
+
+**Progress UX** — `ProgressCallback` now carries `lastTool` and `minSinceLastEvent`. `buildProgressMessage()` in bot.ts shows three tiers: cold-start count, fresh-tool name, or stuck-warning (>=3 min idle). Stalled results show a one-time `/new` keyboard button for quick recovery.
+
+**Improved diagnostics** — Replaced `pgrep claude.*-p` (counted unrelated processes) with session-specific process counting, disk space, and rate-limit snapshot logging.
+
 ## 2026-03-11
 
 ### Production reliability — timeout hierarchy, dead session recovery, media support
