@@ -137,7 +137,7 @@ The safety prompt is **advisory, not enforced**. Claude treats appended system p
 
 ## Working Directory
 
-Claude Code runs with `cwd` set to the user's home directory by default. To change this, modify the `cwd` parameter in `src/claude.ts` (line where `spawn` is called, `cwd: os.homedir()`).
+Claude Code runs with `cwd` set to the user's home directory by default. To change this, modify the `cwd` option in `src/agent.ts`.
 
 ## Running in the Background
 
@@ -170,7 +170,7 @@ which claude
 Your Telegram chat ID doesn't match the `TELEGRAM_CHAT_ID` value. Double-check it with @userinfobot.
 
 ### Messages timing out
-The hard safety timeout is 60 minutes, with progress updates sent every 5 minutes. Progress messages show elapsed time and tool call count. To adjust, edit `SAFETY_TIMEOUT_MS` or `PROGRESS_INTERVAL_MS` in `src/claude.ts`.
+Progress updates are sent every 5 minutes during long operations, showing elapsed time, tool call count, and the name of the current tool. The Agent SDK manages timeouts internally.
 
 ### "TELEGRAM_BOT_TOKEN not set"
 Credentials not loaded. Check:
@@ -180,7 +180,7 @@ Credentials not loaded. Check:
 
 ## Tool Call Audit Trail
 
-The bridge uses `--output-format stream-json` (with `--verbose`) to capture tool calls made by Claude during each message. The conversation log at `logs/YYYY-MM-DD.md` now includes a `*Tools:*` line after each response, showing which tools were used:
+The Agent SDK provides structured tool call events during execution. The conversation log at `logs/YYYY-MM-DD.md` includes a `*Tools:*` line after each response, showing which tools were used:
 
 ```markdown
 ## 04:21
@@ -194,7 +194,7 @@ The bridge uses `--output-format stream-json` (with `--verbose`) to capture tool
 ---
 ```
 
-The `summarizeToolInput` function in `claude.ts` produces human-readable summaries for common tools (Read, Edit, Bash, Glob, Grep, etc.). If no tools were used, the line is omitted.
+The `summarizeToolInput` function in `agent.ts` produces human-readable summaries for common tools (Read, Edit, Bash, Glob, Grep, etc.). If no tools were used, the line is omitted.
 
 ## Email Bridge
 
@@ -206,12 +206,14 @@ The project also includes an email bridge (`src/email-bridge.ts`) that polls Gma
 4. Setting `GMAIL_ALLOWED_SENDER` to the user's email address
 5. Starting with `npm run email`
 
-The email bridge reuses `claude.ts`, `queue.ts`, and `logger.ts` from the Telegram bridge. It has its own safety prompt at `src/email-safety-prompt.txt` and its own per-subject sessions file (default: `~/.claude-email-sessions.json`). Each unique subject line gets its own Claude session — `Re:` and `Fwd:` prefixes are stripped so replies continue the same session.
+The email bridge reuses `agent.ts`, `queue.ts`, and `logger.ts` from the Telegram bridge. It has its own safety prompt at `src/email-safety-prompt.txt` and its own per-subject sessions file (default: `~/.claude-email-sessions.json`). Each unique subject line gets its own Claude session — `Re:` and `Fwd:` prefixes are stripped so replies continue the same session.
 
 ## Important Notes for Agents
 
-- This project uses `--allowed-tools` to whitelist all built-in tools except Bash. When Claude needs Bash, the bridge asks the user via Telegram/email and retries with temporary permission if approved. The safety prompts in `src/safety-prompt.txt` and `src/email-safety-prompt.txt` provide an additional advisory layer.
+- This project uses the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) to invoke Claude Code. The SDK manages CLI subprocess lifecycle, session persistence, and streaming internally.
+- Tool approval uses a **hold-and-release** pattern: the `canUseTool` callback in `agent.ts` pauses Claude's execution while waiting for user approval via Telegram. When the user replies "yes", the stored Promise resolver unblocks the agent. This replaces the older detect-and-rerun approach.
+- The `claude.ts` file is retained as legacy reference but is no longer imported. To revert to subprocess spawning, change imports in `bot.ts` and `email-bridge.ts` from `"./agent"` to `"./claude"`.
+- On macOS, set `CLAUDE_PATH` to your system Claude binary to reuse existing TCC (Full Disk Access) grants. Without this, the SDK's bundled binary triggers new permission prompts on every npm update.
 - The `uuid` package is not used — session IDs use native `crypto.randomUUID()` (Node.js 18+).
-- The `__dirname` reference in `claude.ts` resolves to `src/` at runtime via `tsx`. This works because `tsx` runs TypeScript directly without compiling to a separate `dist/` directory.
 - Conversation logs go to `logs/` which is gitignored. These may contain sensitive information from the user's Claude sessions.
 - The `googleapis` dependency is only used by the email bridge. The Telegram bridge does not require it.

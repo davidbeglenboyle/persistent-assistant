@@ -1,3 +1,8 @@
+/**
+ * LEGACY — This file is retained for reference but is no longer imported.
+ * The bridge now uses agent.ts (Claude Agent SDK) instead of raw subprocess spawning.
+ * To revert: change imports in bot.ts and email-bridge.ts from "./agent" to "./claude".
+ */
 import { spawn, ChildProcess, execFileSync } from "child_process";
 import * as os from "os";
 import * as fs from "fs";

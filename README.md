@@ -26,23 +26,25 @@ Your phone (Telegram)
 Your bot (long-polling, no webhooks needed)
        ↓
 Node.js process (grammy)
-       ↓ FIFO queue (one message at a time)
-       ↓ spawns:
-claude -p --resume $SESSION_ID \
-  --allowed-tools "Read,Edit,Write,..." \
-  --permission-mode default \
-  --output-format stream-json \
-  --append-system-prompt "safety rules..." \
-  "your message"
-       ↓ waits for completion
-       ↓ parses NDJSON response
+       ↓ FIFO queue (one message at a time per topic)
+       ↓ invokes via Agent SDK:
+query({ prompt: "your message", options: {
+  resume: SESSION_ID,
+  allowedTools: ["Read","Edit","Write",...],
+  canUseTool: approvalCallback,
+  systemPrompt: { type: "preset", preset: "claude_code", append: safetyRules }
+}})
+       ↓ streams structured messages
+       ↓ tool approval pauses execution until user replies
 Node.js process
        ↓ extracts response text
        ↓ splits if >4096 chars
 Bot → sends reply to you on Telegram
 ```
 
-Each Telegram message spawns a fresh Claude Code CLI process. There is no persistent background session to manage or keep alive. Session context is preserved because `--resume` loads the full conversation history from disk each time. If one invocation crashes, the next one works fine.
+The bot uses the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) to invoke Claude Code. The SDK manages CLI subprocess lifecycle, session persistence, and streaming internally. Session context is preserved via `resume: sessionId` which loads the full conversation history from disk.
+
+When Claude needs to use a tool that isn't pre-approved (like Bash), the `canUseTool` callback pauses execution, sends a permission prompt to Telegram, and waits for the user to reply "yes". Claude continues seamlessly without re-running. This is the "hold-and-release" pattern.
 
 Long-polling means the bot works behind NAT, firewalls, and home routers without needing ngrok, a public URL, or a webhook server.
 
