@@ -30,7 +30,7 @@ import {
   getAuth,
   type AttachmentInfo,
 } from "./gmail";
-import { runClaude } from "./claude";
+import { runAgent } from "./agent";
 import { enqueue } from "./queue";
 import { logExchange } from "./logger";
 
@@ -287,14 +287,17 @@ async function processEmail(email: {
   // Record the invocation for rate limiting
   recordInvocation(sKey);
 
-  let result = await runClaude(session.sessionId, fullPrompt, isFirst);
+  let result = await runAgent(session.sessionId, fullPrompt, isFirst);
 
-  // Handle dead session: create a new session and retry once
-  if (result.deadSession) {
-    console.log(`  Dead session detected — creating new session and retrying`);
+  // Dead session / context limit — rotate to a fresh session and retry
+  if (result.isError && (
+    result.result.includes("context") ||
+    result.result.includes("Session not found")
+  )) {
+    console.log(`  Session error — rotating to new session`);
     session = newSession(sKey, email.subject);
     activeSessions.delete(session.sessionId);
-    result = await runClaude(session.sessionId, fullPrompt, true);
+    result = await runAgent(session.sessionId, fullPrompt, true);
   }
 
   // Handle capacity errors: defer for retry instead of sending error reply

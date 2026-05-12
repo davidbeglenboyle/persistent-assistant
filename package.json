@@ -14,6 +14,7 @@
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.139",
     "@types/node": "^25.2.1",
     "googleapis": "^144.0.0",
     "grammy": "^1.39.3",

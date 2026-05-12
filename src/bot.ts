@@ -1,5 +1,5 @@
 import { Bot, Context, InputFile } from "grammy";
-import { runClaude, PermissionDenial, ProgressCallback, summarizeToolInput } from "./claude";
+import { runAgent, ToolApprovalCallback, ProgressCallback, summarizeToolInput } from "./agent";
 import { enqueue, queueLength } from "./queue";
 import {
   getOrCreateSession,
@@ -184,10 +184,10 @@ export function createBot(
     }
   }
 
-  // Per-topic pending permission state
-  const pendingPermissions = new Map<
+  // Per-topic pending tool approval state (hold-and-release via Agent SDK canUseTool)
+  const pendingApprovals = new Map<
     string,
-    { denials: PermissionDenial[]; deniedToolNames: string[] }
+    { resolve: (approved: boolean) => void; toolName: string; summary: string; timeout: ReturnType<typeof setTimeout> }
   >();
 
   // Clean up old downloaded images on startup
@@ -259,7 +259,7 @@ export function createBot(
     }
   }
 
-  // Shared processing: enqueue Claude invocation, handle response, permissions, logging
+  // Shared processing: enqueue Claude invocation, handle response, logging
   async function processAndRespond(
     ctx: Context,
     claudeMessage: string,
@@ -267,21 +267,6 @@ export function createBot(
   ): Promise<void> {
     const topicId = getTopicId(ctx);
     const topicLabel = getTopicLabel(topicId);
-    const pending = pendingPermissions.get(topicId);
-
-    // Check if this is a permission approval for a pending denial
-    const isApproval = pending && APPROVAL_PATTERN.test(claudeMessage.trim());
-    const extraTools = isApproval ? pending!.deniedToolNames : [];
-    const finalMessage = isApproval
-      ? "Permission granted for the previously denied tool(s). Please proceed with the previous request."
-      : claudeMessage;
-
-    if (isApproval) {
-      console.log(`  [${topicLabel}] Permission approved for: ${extraTools.join(", ")}`);
-    }
-
-    // Clear pending permission (consumed or superseded by new message)
-    pendingPermissions.delete(topicId);
 
     // Send typing indicator
     await sendTyping(ctx);
@@ -295,7 +280,7 @@ export function createBot(
         const isFirst = !activeSessions.has(session.sessionId);
 
         console.log(
-          `  [${topicLabel}] Running claude (${isFirst ? "new" : "resume"} session ${session.sessionId.slice(0, 8)}...)`
+          `  [${topicLabel}] Running agent (${isFirst ? "new" : "resume"} session ${session.sessionId.slice(0, 8)}...)`
         );
 
         const onProgress: ProgressCallback = (info) => {
@@ -303,55 +288,76 @@ export function createBot(
           console.log(`  [${topicLabel}] Progress: ${info.elapsedMin}min, ${info.toolCallCount} tool calls`);
         };
 
-        const claudeResult = await runClaude(
+        // Hold-and-release tool approval via Agent SDK canUseTool callback.
+        // When Claude wants to use a non-allowed tool (e.g. Bash), this callback:
+        // 1. Posts the approval request to Telegram
+        // 2. Stores a Promise resolver in pendingApprovals
+        // 3. Waits for the user to reply "yes" (resolver called from text handler)
+        // 4. Returns the decision — Claude continues or skips seamlessly
+        const onToolApproval: ToolApprovalCallback = async (toolName, toolInput, summary) => {
+          await reply(ctx, `🔐 Permission needed:\n• ${toolName}: ${summary}\nReply 'yes' to allow.`);
+          console.log(`  [${topicLabel}] Awaiting approval for: ${toolName}: ${summary}`);
+
+          return new Promise<boolean>((resolve) => {
+            const timeout = setTimeout(() => {
+              pendingApprovals.delete(topicId);
+              resolve(false);
+              reply(ctx, "(Tool approval timed out after 10 minutes.)").catch(() => {});
+              console.log(`  [${topicLabel}] Tool approval timed out: ${toolName}`);
+            }, 10 * 60 * 1000);
+
+            pendingApprovals.set(topicId, { resolve, toolName, summary, timeout });
+          });
+        };
+
+        const agentResult = await runAgent(
           session.sessionId,
-          finalMessage,
+          claudeMessage,
           isFirst,
-          extraTools,
+          onToolApproval,
           onProgress
         );
 
-        if (!claudeResult.isError) {
+        if (!agentResult.isError) {
           activeSessions.add(session.sessionId);
           incrementMessage(topicId);
         }
 
-        return claudeResult;
+        return agentResult;
       });
 
-      // Handle dead sessions: start fresh and retry once
-      if (result.deadSession) {
-        console.log(`  [${topicLabel}] Dead session detected, starting fresh session...`);
-        const oldSession = getOrCreateSession(topicId);
-        activeSessions.delete(oldSession.sessionId);
+      // Dead session / context limit recovery
+      if (result.isError && (
+        result.result.includes("context") ||
+        result.result.includes("Session not found")
+      )) {
+        console.log(`  [${topicLabel}] Session error — rotating to fresh session`);
         const freshSession = newSession(topicId);
+        activeSessions.delete(result.sessionId);
+        console.log(`  [${topicLabel}] New session: ${freshSession.sessionId}`);
 
         result = await enqueue(topicId, async () => {
-          console.log(
-            `  [${topicLabel}] Retrying with fresh session ${freshSession.sessionId.slice(0, 8)}...`
-          );
-
           const onProgress: ProgressCallback = (info) => {
             reply(ctx, buildProgressMessage(info)).catch(() => {});
           };
 
-          const claudeResult = await runClaude(
+          const retryResult = await runAgent(
             freshSession.sessionId,
-            finalMessage,
-            true, // isFirst — brand new session
-            extraTools,
+            claudeMessage,
+            true,
+            undefined, // no tool approval on retry
             onProgress
           );
 
-          if (!claudeResult.isError) {
+          if (!retryResult.isError) {
             activeSessions.add(freshSession.sessionId);
             incrementMessage(topicId);
           }
 
-          return claudeResult;
+          return retryResult;
         });
 
-        if (!result.deadSession) {
+        if (!result.isError) {
           console.log(`  [${topicLabel}] Recovery succeeded with fresh session`);
         }
       }
@@ -361,62 +367,16 @@ export function createBot(
       // Log the exchange (including tool calls for audit trail)
       logExchange(logLabel, result.result, result.toolCalls, topicId);
 
-      // Handle stalled results: send partial output with /new keyboard button
-      if (result.stalled) {
-        const threadId = ctx.message?.message_thread_id;
-        const chunks = splitMessage(result.result);
-        for (let i = 0; i < chunks.length; i++) {
-          const isLast = i === chunks.length - 1;
-          const opts: Record<string, unknown> = {};
-          if (mode === "group" && threadId) opts.message_thread_id = threadId;
-          if (isLast) {
-            opts.reply_markup = {
-              keyboard: [[{ text: "/new" }]],
-              resize_keyboard: true,
-              one_time_keyboard: true,
-            };
-          }
-          await ctx.reply(chunks[i], opts);
-        }
-        console.log(`  [${topicLabel}] Done (stalled) in ${(result.durationMs / 1000).toFixed(1)}s`);
-        logExchange("(stalled)", result.result, result.toolCalls, topicId);
-        return;
-      }
-
-      // Build response text
-      let responseText = result.result;
-
-      // Only prompt for permission if Claude couldn't complete the task.
-      // When isError is false, Claude handled the denial gracefully (skipped or found alternatives)
-      // and the permission_denials are informational, not blocking.
-      if (result.permissionDenials.length > 0 && result.isError) {
-        const denialSummaries = result.permissionDenials.map((d) => {
-          const summary = summarizeToolInput(d.tool_name, d.tool_input || {});
-          return `• ${d.tool_name}: \`${summary}\``;
-        });
-        responseText += `\n\n🔐 Permission needed:\n${denialSummaries.join("\n")}\nReply 'yes' to allow.`;
-
-        // Track for next message in this topic
-        const deniedToolNames = [...new Set(result.permissionDenials.map((d) => d.tool_name))];
-        pendingPermissions.set(topicId, {
-          denials: result.permissionDenials,
-          deniedToolNames,
-        });
-        console.log(`  [${topicLabel}] Permission denials: ${deniedToolNames.join(", ")}`);
-      }
-
       // Parse media markers from Claude's response
-      const { cleanText, mediaItems } = parseMediaMarkers(responseText);
+      const { cleanText, mediaItems } = parseMediaMarkers(result.result);
 
       if (mediaItems.length > 0) {
-        // Send each media item, collecting any errors
         const errors: string[] = [];
         for (const item of mediaItems) {
           const err = await sendMediaItem(ctx, item, mode);
           if (err) errors.push(err);
         }
 
-        // Build final text: clean response + any media errors
         let finalText = cleanText;
         if (errors.length > 0) {
           finalText += `\n\n⚠️ Media errors:\n${errors.map((e) => `• ${e}`).join("\n")}`;
@@ -425,8 +385,7 @@ export function createBot(
           await reply(ctx, finalText);
         }
       } else {
-        // No media markers — send text as before
-        await reply(ctx, responseText);
+        await reply(ctx, result.result);
       }
 
       console.log(`  [${topicLabel}] Done in ${(result.durationMs / 1000).toFixed(1)}s`);
@@ -445,7 +404,12 @@ export function createBot(
     if (!isAllowed(ctx)) return;
     const topicId = getTopicId(ctx);
     const topicLabel = getTopicLabel(topicId);
-    pendingPermissions.delete(topicId);
+    const pending = pendingApprovals.get(topicId);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      pendingApprovals.delete(topicId);
+      pending.resolve(false);
+    }
     const session = newSession(topicId);
     activeSessions.delete(session.sessionId);
     await reply(ctx, `Fresh session started.\nID: ${session.sessionId}`);
@@ -807,6 +771,23 @@ export function createBot(
       : userMessage;
 
     console.log(`\n[${topicLabel}] Message received: ${cleanMessage.slice(0, 100)}...`);
+
+    // Check for pending tool approval (hold-and-release pattern)
+    const pendingApproval = pendingApprovals.get(topicId);
+    if (pendingApproval && APPROVAL_PATTERN.test(cleanMessage.trim())) {
+      clearTimeout(pendingApproval.timeout);
+      pendingApprovals.delete(topicId);
+      pendingApproval.resolve(true);
+      console.log(`  [${topicLabel}] Tool approved: ${pendingApproval.toolName}`);
+      markProcessed(updateId);
+      return;
+    }
+    if (pendingApproval) {
+      clearTimeout(pendingApproval.timeout);
+      pendingApprovals.delete(topicId);
+      pendingApproval.resolve(false);
+      console.log(`  [${topicLabel}] Tool denied (new message received): ${pendingApproval.toolName}`);
+    }
 
     markProcessed(updateId); // Acknowledge before processing — prevents replay on crash
     await processAndRespond(ctx, cleanMessage, cleanMessage);
