@@ -1,5 +1,6 @@
 import { Bot, Context, InputFile } from "grammy";
 import { runAgent, ToolApprovalCallback, ProgressCallback, summarizeToolInput } from "./agent";
+import { synthesizeProgress, synthesizePermission } from "./synthesize";
 import { enqueue, queueLength } from "./queue";
 import {
   getOrCreateSession,
@@ -96,35 +97,13 @@ async function sendMediaItem(
 
 // --- End media marker support ---
 
-const APPROVAL_PATTERN = /^(yes|yeah|y|allow|go ahead|approved|do it|ok)$/i;
+// Word-boundary matching: "yes please", "approved!", "okay sure" all work.
+// Strict start-of-string matching caused accidental denials.
+const APPROVAL_PATTERN = /\b(yes|yeah|yep|y|sure|allow|go ahead|approved|approve|do it|ok|okay)\b/i;
+const DENIAL_PATTERN = /^(no|nope|deny|stop|cancel|reject|abort)$/i;
+const BATCH_APPROVE_PATTERN = /\b(approve all|yes to all|allow all)\b/i;
 
 const TELEGRAM_MAX_LENGTH = 4096;
-
-/**
- * Build a three-tier progress message:
- * 1. Cold start (no tool info yet): "Still working... 5 min elapsed (3 tool calls so far)"
- * 2. Fresh tool activity: "Still working... 5 min elapsed — on Agent (search Gmail)"
- * 3. Stuck warning (>= 3 min idle): "Still working... 10 min elapsed — stuck 4+ min on Bash (find ...) — will time out if stuck"
- */
-function buildProgressMessage(info: {
-  elapsedMin: number;
-  toolCallCount: number;
-  lastTool?: { name: string; summary: string };
-  minSinceLastEvent?: number;
-}): string {
-  const { elapsedMin, toolCallCount, lastTool, minSinceLastEvent } = info;
-
-  if (minSinceLastEvent != null && minSinceLastEvent >= 3 && lastTool) {
-    return `Still working... ${elapsedMin} min elapsed — stuck ${minSinceLastEvent}+ min on ${lastTool.name} (${lastTool.summary}) — will time out if stuck`;
-  }
-
-  if (lastTool) {
-    return `Still working... ${elapsedMin} min elapsed — on ${lastTool.name} (${lastTool.summary})`;
-  }
-
-  const toolNote = toolCallCount > 0 ? ` (${toolCallCount} tool calls so far)` : "";
-  return `Still working... ${elapsedMin} min elapsed${toolNote}`;
-}
 
 function splitMessage(text: string): string[] {
   if (text.length <= TELEGRAM_MAX_LENGTH) return [text];
@@ -189,6 +168,12 @@ export function createBot(
     string,
     { resolve: (approved: boolean) => void; toolName: string; summary: string; timeout: ReturnType<typeof setTimeout> }
   >();
+
+  // Per-topic batch approval: "approve all" auto-approves remaining tools in the current run
+  const batchApproved = new Set<string>();
+
+  // Track per-topic user message for synthesis context
+  const lastUserMessage = new Map<string, string>();
 
   // Clean up old downloaded images on startup
   const cleaned = cleanupOldImages();
@@ -284,18 +269,34 @@ export function createBot(
         );
 
         const onProgress: ProgressCallback = (info) => {
-          reply(ctx, buildProgressMessage(info)).catch(() => {});
+          const userMsg = lastUserMessage.get(topicId) || "";
+          synthesizeProgress({
+            userMessage: userMsg,
+            elapsedMin: info.elapsedMin,
+            toolCallCount: info.toolCallCount,
+            lastTool: info.lastTool,
+            recentTools: info.recentTools,
+          }).then((msg) => reply(ctx, msg).catch(() => {}));
           console.log(`  [${topicLabel}] Progress: ${info.elapsedMin}min, ${info.toolCallCount} tool calls`);
         };
 
         // Hold-and-release tool approval via Agent SDK canUseTool callback.
-        // When Claude wants to use a non-allowed tool (e.g. Bash), this callback:
-        // 1. Posts the approval request to Telegram
-        // 2. Stores a Promise resolver in pendingApprovals
-        // 3. Waits for the user to reply "yes" (resolver called from text handler)
-        // 4. Returns the decision — Claude continues or skips seamlessly
+        // When Claude wants to use a non-allowed tool, this callback:
+        // 1. Checks if batch-approved (auto-allow without prompting)
+        // 2. Posts a synthesized approval request to Telegram
+        // 3. Stores a Promise resolver in pendingApprovals
+        // 4. Waits for the user to reply "yes" (resolver called from text handler)
+        // 5. Returns the decision — Claude continues or skips seamlessly
         const onToolApproval: ToolApprovalCallback = async (toolName, toolInput, summary) => {
-          await reply(ctx, `🔐 Permission needed:\n• ${toolName}: ${summary}\nReply 'yes' to allow.`);
+          // Batch-approved: auto-allow without prompting
+          if (batchApproved.has(topicId)) {
+            console.log(`  [${topicLabel}] Batch-approved: ${toolName}: ${summary}`);
+            return true;
+          }
+
+          const userMsg = lastUserMessage.get(topicId) || "";
+          const msg = await synthesizePermission(toolName, summary, userMsg);
+          await reply(ctx, msg);
           console.log(`  [${topicLabel}] Awaiting approval for: ${toolName}: ${summary}`);
 
           return new Promise<boolean>((resolve) => {
@@ -318,6 +319,9 @@ export function createBot(
           onProgress
         );
 
+        // Clear batch approval after run completes
+        batchApproved.delete(topicId);
+
         if (!agentResult.isError) {
           activeSessions.add(session.sessionId);
           incrementMessage(topicId);
@@ -338,7 +342,14 @@ export function createBot(
 
         result = await enqueue(topicId, async () => {
           const onProgress: ProgressCallback = (info) => {
-            reply(ctx, buildProgressMessage(info)).catch(() => {});
+            const userMsg = lastUserMessage.get(topicId) || "";
+            synthesizeProgress({
+              userMessage: userMsg,
+              elapsedMin: info.elapsedMin,
+              toolCallCount: info.toolCallCount,
+              lastTool: info.lastTool,
+              recentTools: info.recentTools,
+            }).then((msg) => reply(ctx, msg).catch(() => {}));
           };
 
           const retryResult = await runAgent(
@@ -410,6 +421,7 @@ export function createBot(
       pendingApprovals.delete(topicId);
       pending.resolve(false);
     }
+    batchApproved.delete(topicId);
     const session = newSession(topicId);
     activeSessions.delete(session.sessionId);
     await reply(ctx, `Fresh session started.\nID: ${session.sessionId}`);
@@ -774,23 +786,56 @@ export function createBot(
 
     // Check for pending tool approval (hold-and-release pattern)
     const pendingApproval = pendingApprovals.get(topicId);
-    if (pendingApproval && APPROVAL_PATTERN.test(cleanMessage.trim())) {
-      clearTimeout(pendingApproval.timeout);
-      pendingApprovals.delete(topicId);
-      pendingApproval.resolve(true);
-      console.log(`  [${topicLabel}] Tool approved: ${pendingApproval.toolName}`);
-      markProcessed(updateId);
-      return;
-    }
     if (pendingApproval) {
-      clearTimeout(pendingApproval.timeout);
-      pendingApprovals.delete(topicId);
-      pendingApproval.resolve(false);
-      console.log(`  [${topicLabel}] Tool denied (new message received): ${pendingApproval.toolName}`);
+      const trimmed = cleanMessage.trim();
+
+      // Batch approve: auto-approve all remaining tools in this run
+      if (BATCH_APPROVE_PATTERN.test(trimmed)) {
+        clearTimeout(pendingApproval.timeout);
+        pendingApprovals.delete(topicId);
+        batchApproved.add(topicId);
+        pendingApproval.resolve(true);
+        console.log(`  [${topicLabel}] Batch approved (all tools for this run)`);
+        markProcessed(updateId);
+        return;
+      }
+
+      // Single approve
+      if (APPROVAL_PATTERN.test(trimmed)) {
+        clearTimeout(pendingApproval.timeout);
+        pendingApprovals.delete(topicId);
+        pendingApproval.resolve(true);
+        console.log(`  [${topicLabel}] Tool approved: ${pendingApproval.toolName}`);
+        markProcessed(updateId);
+        return;
+      }
+
+      // Explicit deny
+      if (DENIAL_PATTERN.test(trimmed)) {
+        clearTimeout(pendingApproval.timeout);
+        pendingApprovals.delete(topicId);
+        pendingApproval.resolve(false);
+        console.log(`  [${topicLabel}] Tool denied: ${pendingApproval.toolName}`);
+        markProcessed(updateId);
+        return;
+      }
+
+      // Non-matching message: do NOT auto-deny. Queue it normally and
+      // leave the approval pending. This prevents accidental denials when
+      // the user sends instructions while an approval is waiting.
+      console.log(`  [${topicLabel}] Non-matching message while approval pending — queuing normally`);
     }
 
     markProcessed(updateId); // Acknowledge before processing — prevents replay on crash
-    await processAndRespond(ctx, cleanMessage, cleanMessage);
+    lastUserMessage.set(topicId, cleanMessage);
+
+    // CRITICAL: Fire-and-forget. grammY processes updates sequentially —
+    // awaiting processAndRespond blocks the entire update loop, preventing
+    // approval replies from being processed. The per-topic queue still
+    // handles serialization within each topic.
+    processAndRespond(ctx, cleanMessage, cleanMessage).catch((err) => {
+      console.error(`  [${topicLabel}] Unhandled processAndRespond error:`, err);
+    });
   });
 
   return bot;
