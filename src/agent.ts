@@ -40,11 +40,16 @@ export type ProgressCallback = (info: {
   elapsedMin: number;
   toolCallCount: number;
   lastTool?: { name: string; summary: string };
+  recentTools: Array<{ name: string; summary: string }>;
 }) => void;
 
-// Tools pre-approved without user confirmation. Bash requires explicit approval.
+// Tools pre-approved without user confirmation.
+// Bash is included — the advisory safety prompt in safety-prompt.txt provides
+// guardrails for destructive operations. Removing Bash from this list caused
+// repeated approval friction that made multi-step tasks unusable via Telegram.
 const ALLOWED_TOOLS = [
   "Read", "Edit", "Write", "Glob", "Grep",
+  "Bash",
   "WebFetch", "WebSearch", "NotebookEdit", "Skill",
   "TaskCreate", "TaskGet", "TaskUpdate", "TaskList",
   "TaskOutput", "TaskStop", "Agent",
@@ -142,14 +147,14 @@ export async function runAgent(
   if (onProgress) {
     progressTimer = setInterval(() => {
       const elapsedMin = Math.floor((Date.now() - startTime) / 60000);
-      onProgress({ elapsedMin, toolCallCount: toolCalls.length, lastTool });
+      onProgress({ elapsedMin, toolCallCount: toolCalls.length, lastTool, recentTools: toolCalls.slice(-8) });
     }, PROGRESS_INTERVAL_MS);
   }
 
   try {
     const options: Record<string, unknown> = {
       allowedTools: ALLOWED_TOOLS,
-      permissionMode: "default",
+      permissionMode: "bypassPermissions",
       systemPrompt: {
         type: "preset",
         preset: "claude_code",

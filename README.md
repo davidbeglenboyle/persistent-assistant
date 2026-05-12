@@ -56,7 +56,8 @@ Long-polling means the bot works behind NAT, firewalls, and home routers without
 * **Photo support** — Send images via Telegram for Claude to analyse using its multimodal Read tool
 * **Update deduplication** — Prevents message replay on bot restarts
 * **Progress updates** — Long-running tasks send "Still working..." updates every 5 minutes
-* **Enforced tool permissions** — `--allowed-tools` whitelist pre-approves safe tools; denied tools are surfaced via Telegram for approval
+* **Enforced tool permissions** — `allowedTools` whitelist pre-approves safe tools including Bash; denied tools are surfaced via Telegram for approval with batch approve support ("approve all")
+* **Message synthesis** — Progress updates and permission requests are rewritten by Claude Haiku into plain English before reaching Telegram
 * **Safety prompt** — An advisory system prompt that requires Claude to ask for confirmation before destructive actions (file deletion, force push, sending emails, etc.)
 * **Chat ID whitelist** — Only your Telegram account can talk to the bot
 * **Auto-split long responses** — Messages longer than Telegram's 4,096-character limit are split automatically
@@ -93,7 +94,7 @@ For manual setup, read [CLAUDE.md](CLAUDE.md) directly.
 
 Read this section carefully before using.
 
-1. **Tool permissions are enforced, not advisory.** The bridge uses `--allowed-tools` to whitelist safe tools (file reading, editing, search, web access). When Claude tries to use a tool that is not whitelisted — typically Bash — the bridge surfaces the exact command on Telegram and waits for your approval. This is a hard boundary enforced by Claude Code, not a prompt-level suggestion. However, pre-approved tools (Read, Write, Edit, Glob, Grep, etc.) execute without asking.
+1. **Tool permissions are enforced, not advisory.** The bridge uses `allowedTools` to whitelist safe tools including Bash, file reading, editing, search, and web access. The `permissionMode` is `bypassPermissions`, so the whitelist and `canUseTool` callback are the sole permission boundary. Tools not on the list are denied and surfaced via Telegram for approval. Pre-approved tools (including Bash) execute without asking. The advisory safety prompt provides a second, conversational layer for destructive operations.
 
 2. **The safety prompt is advisory.** On top of the enforced tool whitelist, an appended system prompt instructs Claude to ask for confirmation before destructive actions. Claude treats this with high priority in practice, but it is not a hard technical boundary.
 
@@ -120,6 +121,7 @@ persistent-assistant/
 │   ├── logger.ts             # Daily conversation logs with topic labels (shared)
 │   ├── download.ts           # Download Telegram photos to /tmp/ + auto-cleanup
 │   ├── dedup.ts              # Update deduplication (prevents restart replay)
+│   ├── synthesize.ts         # Haiku-powered plain-English synthesis for progress/permission messages
 │   ├── safety-prompt.txt     # Telegram safety rules (editable)
 │   └── email-safety-prompt.txt  # Email safety rules (editable)
 ├── scripts/
@@ -130,7 +132,7 @@ persistent-assistant/
 └── package.json
 ```
 
-The Telegram and Email bridges share `claude.ts` (CLI spawner), `queue.ts` (per-topic FIFO), `session.ts` (per-topic sessions), and `logger.ts` (daily logs). Each has its own entry point and safety prompt.
+The Telegram and Email bridges share `agent.ts` (Agent SDK wrapper), `queue.ts` (per-topic FIFO), `session.ts` (per-topic sessions), `logger.ts` (daily logs), and `synthesize.ts` (Haiku-powered message synthesis). Each has its own entry point and safety prompt.
 
 ### Two-layer safety model
 
@@ -138,7 +140,13 @@ Safety is enforced at two levels:
 
 **Layer 1: Tool whitelist (enforced by Claude Code)**
 
-The bridge passes `--allowed-tools` with a whitelist of safe tools: Read, Edit, Write, Glob, Grep, Task, WebFetch, WebSearch, and others. Tools not on the list — primarily Bash — are denied by Claude Code at the engine level. When a denial occurs, the bridge shows the exact tool and input on Telegram and waits for approval. If you reply "yes", the bridge retries with that tool temporarily allowed.
+The bridge passes `allowedTools` with a whitelist of safe tools including Bash, Read, Edit, Write, Glob, Grep, Task, WebFetch, WebSearch, and others. The `permissionMode` is set to `bypassPermissions`, meaning the tool whitelist and `canUseTool` callback are the sole permission boundary. When Claude tries to use a tool not on the list, the bridge sends a plain-English permission prompt to Telegram (rewritten by Haiku via `synthesize.ts`) and waits for approval.
+
+**Approval patterns (word-boundary matching, case-insensitive):**
+* **Approve:** "yes", "yeah", "sure", "go ahead", "approved", "ok" (and surrounding text, e.g., "yes please")
+* **Batch approve:** "approve all", "yes to all", "allow all" — auto-approves all remaining tools for the current agent run
+* **Deny:** "no", "cancel", "reject", "abort" (exact match only)
+* **Non-matching message:** does NOT deny the pending approval. The message is queued normally and the approval stays pending (10-minute timeout). This prevents accidental denials when you send instructions while an approval is waiting.
 
 **Layer 2: Safety prompt (advisory)**
 
@@ -150,9 +158,11 @@ The file `src/safety-prompt.txt` is injected into every invocation via `--append
 4. **Ambiguous requests** — ask for clarification when messages are vague
 5. **Multi-step tasks** — outline the plan before executing 5+ tool calls
 
-Both layers use the same confirmation flow: Claude asks "should I proceed?", you reply "yes" on Telegram, and the next `--resume` invocation picks up the context and executes.
-
 You can edit `src/safety-prompt.txt` to add your own rules without touching any TypeScript.
+
+### Message synthesis
+
+Progress updates and permission requests are rewritten by Claude Haiku (`src/synthesize.ts`) into plain English before reaching Telegram. Instead of raw tool summaries, you see human-friendly messages. This requires an `ANTHROPIC_API_KEY` environment variable. If the key is not set or the Haiku API call fails, messages fall back to a simple format.
 
 ## Forum/Topic Mode
 
@@ -339,7 +349,7 @@ Each bridge maintains its own session UUID, so conversations are independent. Us
 |---------|----------|---------|
 | Claude binary path | `CLAUDE_PATH` env var | Auto-detected |
 | Bridge mode | `BRIDGE_MODE` env var | `dm` |
-| Tool whitelist | `ALLOWED_TOOLS` in `src/claude.ts` | All built-in tools except Bash |
+| Tool whitelist | `ALLOWED_TOOLS` in `src/agent.ts` | All built-in tools including Bash |
 | Safety timeout | `src/claude.ts` | 60 minutes (progress every 5 min) |
 | Telegram message limit | `src/bot.ts` | 4,096 characters |
 | Safety prompt | `src/safety-prompt.txt` | Editable text file |

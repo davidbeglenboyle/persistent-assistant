@@ -110,7 +110,23 @@ Tell the user to send a test message via Telegram. They should receive a respons
 - `/status` — Show current session ID, creation time, message count, and queue depth for the current topic.
 - `/topics` — List all active topics with message counts (useful in forum/group mode).
 
-## Safety Prompt
+## Safety Model
+
+The bridge uses two layers of safety:
+
+**Layer 1: Tool whitelist (enforced by Claude Code)**
+
+The `ALLOWED_TOOLS` list in `src/agent.ts` pre-approves safe tools including Bash. Tools not on the list are denied by the Agent SDK. When a denial occurs, the bridge sends a plain-English permission prompt to Telegram (rewritten by Haiku via `src/synthesize.ts`) and waits for the user to reply.
+
+The `permissionMode` is set to `bypassPermissions` in `agent.ts`, meaning the `ALLOWED_TOOLS` list and the `canUseTool` callback are the sole permission boundary. The advisory safety prompt provides a second, conversational layer.
+
+**Approval patterns (word-boundary matching, case-insensitive):**
+- **Approve:** "yes", "yeah", "sure", "go ahead", "approved", "ok" (and surrounding text, e.g., "yes please")
+- **Batch approve:** "approve all", "yes to all", "allow all" — auto-approves all remaining tools for the current agent run
+- **Deny:** "no", "cancel", "reject", "abort" (exact match only)
+- **Non-matching message:** does NOT deny the pending approval. The message is queued normally and the approval stays pending (10-minute timeout)
+
+**Layer 2: Advisory safety prompt**
 
 The file `src/safety-prompt.txt` is injected into every Claude invocation via `--append-system-prompt`. It instructs Claude to ask for confirmation before:
 
@@ -123,6 +139,12 @@ The file `src/safety-prompt.txt` is injected into every Claude invocation via `-
 Users can edit this file freely to add custom rules. No TypeScript changes needed.
 
 The safety prompt is **advisory, not enforced**. Claude treats appended system prompts with high priority in practice, but there is no hard technical boundary preventing Claude from acting without confirmation.
+
+## Message Synthesis
+
+Progress updates and permission requests are rewritten by Claude Haiku (`src/synthesize.ts`) into plain English before reaching Telegram. Instead of raw tool summaries like `on TaskOutput ({"task_id":"bf6xhoib4"})`, you see messages like "Waiting for a background task to finish."
+
+This requires an `ANTHROPIC_API_KEY` environment variable. If the key is not set or the API call fails, messages fall back to a simple format. The Haiku calls have a 5-second timeout and are best-effort.
 
 ## Session Management
 
@@ -211,7 +233,8 @@ The email bridge reuses `agent.ts`, `queue.ts`, and `logger.ts` from the Telegra
 ## Important Notes for Agents
 
 - This project uses the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) to invoke Claude Code. The SDK manages CLI subprocess lifecycle, session persistence, and streaming internally.
-- Tool approval uses a **hold-and-release** pattern: the `canUseTool` callback in `agent.ts` pauses Claude's execution while waiting for user approval via Telegram. When the user replies "yes", the stored Promise resolver unblocks the agent. This replaces the older detect-and-rerun approach.
+- Tool approval uses a **hold-and-release** pattern: the `canUseTool` callback in `agent.ts` pauses Claude's execution while waiting for user approval via Telegram. When the user replies "yes" (or "approve all" for batch approval), the stored Promise resolver unblocks the agent. Non-matching messages do not auto-deny — they are queued normally. This replaces the older detect-and-rerun approach.
+- The text handler in `bot.ts` uses **fire-and-forget** for `processAndRespond` — it does not `await` the call. This is critical because grammY processes updates sequentially; awaiting would block the entire update loop and prevent approval replies from being processed.
 - The `claude.ts` file is retained as legacy reference but is no longer imported. To revert to subprocess spawning, change imports in `bot.ts` and `email-bridge.ts` from `"./agent"` to `"./claude"`.
 - On macOS, set `CLAUDE_PATH` to your system Claude binary to reuse existing TCC (Full Disk Access) grants. Without this, the SDK's bundled binary triggers new permission prompts on every npm update.
 - The `uuid` package is not used — session IDs use native `crypto.randomUUID()` (Node.js 18+).
