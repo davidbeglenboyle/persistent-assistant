@@ -328,12 +328,15 @@ async function processEmail(email: {
   // Build response
   let responseText = result.result;
 
-  if (result.permissionDenials.length > 0) {
-    const denials = result.permissionDenials.map((d) => {
+  // Guard: AgentResult from the SDK may not include permissionDenials
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const denials = ((result as any).permissionDenials || []) as Array<{ tool_name: string; tool_input?: Record<string, unknown> }>;
+  if (denials.length > 0) {
+    const denialLines = denials.map((d) => {
       const input = JSON.stringify(d.tool_input || {}).slice(0, 80);
       return `  - ${d.tool_name}: ${input}`;
     });
-    responseText += `\n\nPermission needed for:\n${denials.join("\n")}\nReply to this email with "yes" to approve.`;
+    responseText += `\n\nPermission needed for:\n${denialLines.join("\n")}\nReply to this email with "yes" to approve.`;
   }
 
   await markAsRead(email.id);
